@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.8.0
+// @version      1.10.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -95,6 +95,12 @@
   const RESTOCK_RATIO = 0.5;                      // refill ≈ half sell-out time
   const MIN_POINTS_FOR_FIT = 4;                   // need this many to trust a rate
   const MIN_DECLINE_FOR_FIT = 30;                 // and this much total drop (items)
+
+  // Buy-on-arrival policy: you land, buy, leave. You will not wait at a
+  // destination for a restock. Any item that isn't already on the shelf when
+  // you land is a no-fly. This is the max seconds you'd tolerate waiting; set
+  // to 15 to match the post-arrival grace period, effectively "no waiting".
+  const MAX_WAIT_SEC = 15;
 
   // ---------------------------------------------------------------------
   // State
@@ -387,6 +393,7 @@
       sellRate: null,
       etaEmptyMin: null,
       nextRestockMs: null,
+      restockPeak: null,
       confidence: 'low',
     };
     if (!series || series.length < MIN_POINTS_FOR_FIT) return result;
@@ -394,6 +401,9 @@
     const qty = series[series.length - 1][1];
     const rate = sellRatePerMin(series);
     result.sellRate = rate;
+    // Highest stock seen: a stand-in for how much a fresh restock puts on the
+    // shelf. Used to project stock when an empty item refills mid-flight.
+    result.restockPeak = Math.max(...series.map((p) => p[1]));
 
     if (qty <= 0) {
       result.state = 'empty';
@@ -519,7 +529,7 @@
     }
 
     // Watched first, then Go verdicts above Wait/Risky, then by profit/hour.
-    const order = { go: 0, risky: 1, wait: 2, learning: 3, skip: 4 };
+    const order = { go: 0, risky: 1, learning: 2, skip: 3 };
     rows.sort((a, b) => {
       if (a.isWatched !== b.isWatched) return a.isWatched ? -1 : 1;
       const oa = order[a.verdict.code] ?? 5;
@@ -542,6 +552,11 @@
     const landMs = now + (takeoffDelayMin + oneWayMin) * 60000;
     const cap = effectiveCapacity();
 
+    // Buy-on-arrival: stock must already be on the shelf when you land, with no
+    // more than MAX_WAIT_SEC of slack. Treat the landing-plus-grace moment as
+    // the deadline by which stock must exist; anything restocking later is out.
+    const buyByMs = landMs + MAX_WAIT_SEC * 1000;
+
     if (pred.state === 'learning') {
       return {
         code: 'learning',
@@ -552,20 +567,46 @@
     }
 
     if (pred.state === 'empty') {
-      if (pred.nextRestockMs && pred.nextRestockMs <= landMs) {
-        const slackMin = Math.round((landMs - pred.nextRestockMs) / 60000);
+      // Empty now, but it may refill while you're in the air. You won't wait at
+      // the shop, so the restock must land before you do AND still have stock
+      // left after post-restock selling by the time you arrive.
+      if (pred.nextRestockMs && pred.nextRestockMs <= buyByMs) {
+        // Minutes the shelf sells for between restock and your arrival.
+        const sellMinAfterRestock = Math.max(0, (landMs - pred.nextRestockMs) / 60000);
+        const peak = pred.restockPeak || 0;
+        const rate = pred.sellRate || 0;
+        const projected = Math.max(0, Math.round(peak - rate * sellMinAfterRestock));
+
+        if (projected >= cap) {
+          return {
+            code: 'go',
+            label: 'Go',
+            reason: `Refills ~${fmtClock(pred.nextRestockMs)}, ~${projected} still there when you land`,
+            expectedStockOnArrival: projected,
+          };
+        }
+        if (projected >= 1) {
+          return {
+            code: 'risky',
+            label: 'Risky',
+            reason: `Refills ~${fmtClock(pred.nextRestockMs)} but only ~${projected} left on arrival`,
+            expectedStockOnArrival: projected,
+          };
+        }
+        // Refilled but sold out again before you land.
         return {
-          code: 'go',
-          label: 'Go',
-          reason: `Empty now, restock ~${fmtClock(pred.nextRestockMs)}, you land ${slackMin}m after`,
-          expectedStockOnArrival: cap, // fresh cycle, assume buyable
+          code: 'skip',
+          label: 'No fly',
+          reason: `Refills ~${fmtClock(pred.nextRestockMs)} but sells out again before you land`,
+          expectedStockOnArrival: 0,
         };
       }
+      // No restock before you land: nothing on the shelf, and you won't wait.
       return {
         code: 'skip',
-        label: 'Skip',
+        label: 'No fly',
         reason: pred.nextRestockMs
-          ? `Empty, restock ~${fmtClock(pred.nextRestockMs)} after you'd land`
+          ? `Empty, next restock ~${fmtClock(pred.nextRestockMs)} after you'd land`
           : 'Empty, no restock estimate',
         expectedStockOnArrival: 0,
       };
@@ -573,8 +614,8 @@
 
     if (pred.state === 'depleting' && pred.etaEmptyMin != null) {
       const emptyMs = now + pred.etaEmptyMin * 60000;
-      // Stock projected to last past your landing: safe.
-      if (emptyMs >= landMs) {
+      // Stock still on the shelf when you land (within grace): buyable now.
+      if (emptyMs >= buyByMs) {
         const minsToLanding = (landMs - now) / 60000;
         const projected = Math.max(
           0,
@@ -584,49 +625,41 @@
           return {
             code: 'go',
             label: 'Go',
-            reason: `~${projected} left on arrival, enough for ${cap}`,
+            reason: `~${projected} on the shelf when you land, fills ${cap}`,
             expectedStockOnArrival: projected,
           };
         }
-        return {
-          code: 'risky',
-          label: 'Risky',
-          reason: `Only ~${projected} left on arrival, may not fill ${cap}`,
-          expectedStockOnArrival: projected,
-        };
+        if (projected >= 1) {
+          return {
+            code: 'risky',
+            label: 'Risky',
+            reason: `Only ~${projected} left on arrival, partial load`,
+            expectedStockOnArrival: projected,
+          };
+        }
       }
-      // Sells out before you land: depends on whether it restocks in time.
-      const selloutDur = pred.etaEmptyMin; // rough proxy for next cycle length
-      const restockMs = nextTick(emptyMs + selloutDur * RESTOCK_RATIO * 60000);
-      if (restockMs <= landMs) {
-        return {
-          code: 'go',
-          label: 'Go',
-          reason: `Sells out ~${fmtClock(emptyMs)}, refills ~${fmtClock(restockMs)} before you land`,
-          expectedStockOnArrival: cap,
-        };
-      }
+      // Sells out at or before you land. You won't wait for the refill.
       return {
-        code: 'wait',
-        label: 'Wait',
-        reason: `Sells out before landing, refill ~${fmtClock(restockMs)} too late`,
+        code: 'skip',
+        label: 'No fly',
+        reason: `Sells out ~${fmtClock(emptyMs)}, before you land. You'd have to wait`,
         expectedStockOnArrival: 0,
       };
     }
 
-    // In stock, no measurable decline: treat current stock as available.
+    // In stock, no measurable decline: stock is sitting there to grab.
     if (stockItem.quantity >= cap) {
       return {
         code: 'go',
         label: 'Go',
-        reason: `${stockItem.quantity} in stock, stable`,
+        reason: `${stockItem.quantity} in stock, stable, grab and go`,
         expectedStockOnArrival: stockItem.quantity,
       };
     }
     return {
       code: 'risky',
       label: 'Risky',
-      reason: `Only ${stockItem.quantity} in stock`,
+      reason: `Only ${stockItem.quantity} in stock, partial load`,
       expectedStockOnArrival: stockItem.quantity,
     };
   }
