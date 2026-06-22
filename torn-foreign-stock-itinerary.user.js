@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.11.0
+// @version      1.13.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -698,17 +698,19 @@
     /* When collapsed, only the header bar shows. */
     #tsi-panel.tsi-collapsed { overflow: hidden; }
     #tsi-panel.tsi-collapsed .tsi-body { display: none; }
-    /* Narrow screens (PDA / mobile): dock to the bottom, full width,
-       so the panel never covers the travel shop while you read it. */
+    /* Narrow screens (PDA / mobile): dock near the bottom, full width. Lift it
+       above PDA's bottom tab bar (the building/gym/globe/box icon row) plus the
+       device safe-area inset, so the panel isn't hidden behind those tabs.
+       PDA_TAB_CLEARANCE below is the gap; raise it if your tab bar is taller. */
     @media (max-width: 784px) {
       #tsi-panel {
         top: auto;
-        bottom: 0;
+        bottom: calc(64px + env(safe-area-inset-bottom, 0px));
         right: 0;
         left: 0;
         width: 100%;
         max-width: 100%;
-        max-height: 55vh;
+        max-height: 50vh;
         border-radius: 6px 6px 0 0;
       }
     }
@@ -766,6 +768,31 @@
     #tsi-panel tr.tsi-item-row { cursor: pointer; }
     #tsi-panel tr.tsi-item-row:hover { background: #242424; }
     #tsi-panel tr.tsi-item-row.tsi-watched:hover { background: #38331a; }
+    /* Settings section, toggled by the gear. */
+    #tsi-panel .tsi-settings {
+      border-top: 1px solid #333;
+      border-bottom: 1px solid #333;
+      margin: 6px 0;
+      padding: 6px 0;
+    }
+    #tsi-panel .tsi-settings.tsi-settings-hidden { display: none; }
+    #tsi-panel .tsi-settings > div { margin: 4px 0; }
+    #tsi-panel #tsi-glance { font-size: 11px; margin-bottom: 4px; }
+    /* Narrow screens (PDA): drop secondary columns, enlarge touch targets,
+       and let settings controls fill the width so they stop cramming. */
+    @media (max-width: 784px) {
+      #tsi-panel .tsi-col-extra { display: none; }
+      #tsi-panel input, #tsi-panel button, #tsi-panel select {
+        font-size: 14px;
+        padding: 6px 8px;
+      }
+      #tsi-panel .tsi-settings select,
+      #tsi-panel #tsi-watch { width: 100% !important; box-sizing: border-box; }
+      #tsi-panel .tsi-settings > div { margin: 8px 0; }
+      #tsi-panel th, #tsi-panel td { padding: 6px 4px; }
+      #tsi-panel .tsi-toggle { font-size: 20px; padding: 4px 8px; }
+      #tsi-panel .tsi-verdict { font-size: 12px; padding: 2px 7px; }
+    }
   `);
 
   function buildPanel() {
@@ -774,80 +801,91 @@
     panel.innerHTML = `
       <h3>
         <span>Foreign Stock Itinerary</span>
-        <button class="tsi-toggle" id="tsi-collapse">_</button>
+        <span>
+          <button class="tsi-toggle" id="tsi-gear" title="Settings">⚙</button>
+          <button class="tsi-toggle" id="tsi-collapse">_</button>
+        </span>
       </h3>
       <div class="tsi-body" id="tsi-body">
         <div class="tsi-status" id="tsi-status">Loading...</div>
-        <div>
-          API key:
-          <input id="tsi-key" type="password" placeholder="Torn API key" style="width:140px"
-                 autocomplete="off" value="${TORN_API_KEY}">
-          <button id="tsi-key-show" type="button" title="Show/hide key">👁</button>
-          <button id="tsi-save-key">Save</button>
-        </div>
-        <div>
-          Watchlist:
-          <input id="tsi-watch" type="text" style="width:200px"
-                 value="${watchlist.join(', ')}">
-          <button id="tsi-save-watch">Save</button>
-        </div>
-        <div>
-          <label style="margin-right:10px">
-            <input type="checkbox" id="tsi-watchfilter"${watchlistFilter ? ' checked' : ''}>
-            Only watchlist
-          </label>
-          <label>
-            <input type="checkbox" id="tsi-affordfilter"${affordFilter ? ' checked' : ''}>
-            Hide unaffordable
-          </label>
-          <span id="tsi-money" style="color:#9fe8b0;margin-left:6px"></span>
-        </div>
-        <div>
-          Country:
-          <select id="tsi-country" style="width:150px">
-            <option value="all"${countryFilter === 'all' ? ' selected' : ''}>All countries</option>
-            ${Object.entries(COUNTRIES)
-              .map(
-                ([code, c]) =>
-                  `<option value="${code}"${
-                    code === countryFilter ? ' selected' : ''
-                  }>${c.name}</option>`
-              )
-              .join('')}
-          </select>
-          <span id="tsi-location" style="color:#9fb8e8;margin-left:6px"></span>
-        </div>
-        <div>
-          Travel:
-          <select id="tsi-method" style="width:150px">
-            ${Object.entries(TRAVEL_METHODS)
-              .map(
-                ([key, m]) =>
-                  `<option value="${key}"${
-                    key === travelMethod ? ' selected' : ''
-                  }>${m.name}</option>`
-              )
-              .join('')}
-          </select>
-          <label style="margin-left:6px">
-            <input type="checkbox" id="tsi-mailing"${mailingBook ? ' checked' : ''}>
-            Mailing book (-25%)
-          </label>
-        </div>
-        <div>
-          Base capacity:
-          <input id="tsi-capacity" type="number" min="1" max="44" style="width:50px"
-                 value="${baseCapacity}">
-          <span id="tsi-effcap" style="color:#888"></span>
-          <button id="tsi-save-capacity">Save</button>
-          <button id="tsi-refresh">Refresh now</button>
+        <div id="tsi-glance">
+          <span id="tsi-location" style="color:#9fb8e8"></span>
+          <span id="tsi-money" style="color:#9fe8b0;margin-left:8px"></span>
         </div>
         <div id="tsi-bestpick" style="margin:6px 0;padding:5px;background:#14241a;border-radius:4px;display:none"></div>
+
+        <div class="tsi-settings tsi-settings-hidden" id="tsi-settings">
+          <div>
+            API key:
+            <input id="tsi-key" type="password" placeholder="Torn API key" style="width:140px"
+                   autocomplete="off" value="${TORN_API_KEY}">
+            <button id="tsi-key-show" type="button" title="Show/hide key">👁</button>
+            <button id="tsi-save-key">Save</button>
+          </div>
+          <div>
+            Watchlist:
+            <input id="tsi-watch" type="text" style="width:200px"
+                   value="${watchlist.join(', ')}">
+            <button id="tsi-save-watch">Save</button>
+          </div>
+          <div>
+            <label style="margin-right:10px">
+              <input type="checkbox" id="tsi-watchfilter"${watchlistFilter ? ' checked' : ''}>
+              Only watchlist
+            </label>
+            <label>
+              <input type="checkbox" id="tsi-affordfilter"${affordFilter ? ' checked' : ''}>
+              Hide unaffordable
+            </label>
+          </div>
+          <div>
+            Country:
+            <select id="tsi-country" style="width:150px">
+              <option value="all"${countryFilter === 'all' ? ' selected' : ''}>All countries</option>
+              ${Object.entries(COUNTRIES)
+                .map(
+                  ([code, c]) =>
+                    `<option value="${code}"${
+                      code === countryFilter ? ' selected' : ''
+                    }>${c.name}</option>`
+                )
+                .join('')}
+            </select>
+          </div>
+          <div>
+            Travel:
+            <select id="tsi-method" style="width:150px">
+              ${Object.entries(TRAVEL_METHODS)
+                .map(
+                  ([key, m]) =>
+                    `<option value="${key}"${
+                      key === travelMethod ? ' selected' : ''
+                    }>${m.name}</option>`
+                )
+                .join('')}
+            </select>
+            <label style="margin-left:6px">
+              <input type="checkbox" id="tsi-mailing"${mailingBook ? ' checked' : ''}>
+              Mailing book (-25%)
+            </label>
+          </div>
+          <div>
+            Base capacity:
+            <input id="tsi-capacity" type="number" min="1" max="44" style="width:50px"
+                   value="${baseCapacity}">
+            <span id="tsi-effcap" style="color:#888"></span>
+            <button id="tsi-save-capacity">Save</button>
+            <button id="tsi-refresh">Refresh now</button>
+          </div>
+        </div>
+
         <table id="tsi-table">
           <thead>
             <tr>
-              <th>Fly?</th><th>Country</th><th>Item</th><th>Stock</th>
-              <th>Restock</th><th>RT</th><th>$/hr</th>
+              <th>Fly?</th><th>Item</th><th>Stock</th><th>$/hr</th>
+              <th class="tsi-col-extra">Country</th>
+              <th class="tsi-col-extra">Restock</th>
+              <th class="tsi-col-extra">RT</th>
             </tr>
           </thead>
           <tbody id="tsi-tbody"></tbody>
@@ -860,6 +898,11 @@
     // Start collapsed on narrow screens so the panel doesn't block the shop.
     const isNarrow = window.matchMedia('(max-width: 784px)').matches;
     if (isNarrow) panel.classList.add('tsi-collapsed');
+    // Settings start open on desktop (room to spare), closed on narrow so the
+    // results table is the default view. The gear toggles either way.
+    if (!isNarrow) {
+      document.getElementById('tsi-settings').classList.remove('tsi-settings-hidden');
+    }
 
     panel.querySelector('h3').addEventListener('click', () => {
       panel.classList.toggle('tsi-collapsed');
@@ -871,6 +914,13 @@
     });
     // Reflect initial state in the button glyph.
     document.getElementById('tsi-collapse').textContent = isNarrow ? '+' : '_';
+
+    // Gear toggles the settings section. Stop the click bubbling to the header
+    // so it doesn't also collapse the whole panel.
+    document.getElementById('tsi-gear').addEventListener('click', (e) => {
+      e.stopPropagation();
+      document.getElementById('tsi-settings').classList.toggle('tsi-settings-hidden');
+    });
 
     document.getElementById('tsi-save-key').addEventListener('click', () => {
       const val = document.getElementById('tsi-key').value.trim();
@@ -1065,12 +1115,12 @@
         const mainRow = `
           <tr class="tsi-item-row ${r.isWatched ? 'tsi-watched' : ''}" data-key="${key}">
             <td>${verdictCell(r.verdict)}</td>
-            <td>${r.country}</td>
             <td>${r.item}${r.isWatched ? ' ★' : ''}</td>
             <td>${r.quantity}${r.cashLimited ? ` <span style="color:#f0d27a" title="Cash only covers ${r.itemsAvailable}">(buy ${r.itemsAvailable})</span>` : ''}</td>
-            <td>${restockCell(r, now)}</td>
-            <td>${formatTime(r.roundTripMin)}</td>
             <td class="${profitClass}">${formatMoney(r.profitPerHour)}</td>
+            <td class="tsi-col-extra">${r.country}</td>
+            <td class="tsi-col-extra">${restockCell(r, now)}</td>
+            <td class="tsi-col-extra">${formatTime(r.roundTripMin)}</td>
           </tr>
         `;
         if (!isOpen) return mainRow;
