@@ -21,7 +21,7 @@ You need a userscript manager first.
 
 Then install the script:
 
-1. Open this link: [install the script](https://raw.githubusercontent.com/__GH_USER__/__REPO__/main/torn-foreign-stock-itinerary.user.js)
+1. Open this link: [install the script](https://raw.githubusercontent.com/mat-mcc-uk/torn-stock-itinerary/main/torn-foreign-stock-itinerary.user.js)
 2. Tampermonkey shows an install page. Click **Install**.
 3. On Torn PDA, go to Settings, User Scripts, add a new script, and paste the same raw URL or the file contents.
 
@@ -81,7 +81,7 @@ Two constants near the top of the script tune the model once you've watched real
 
 ## Credits
 
-Stock data from [YATA](https://yata.yt). Built for and shared with faction members. Report problems on the [issues page](https://github.com/__GH_USER__/__REPO__/issues).
+Stock data from [YATA](https://yata.yt). Built for and shared with faction members. Report problems on the [issues page](https://github.com/mat-mcc-uk/torn-stock-itinerary/issues).
 
 ## License
 

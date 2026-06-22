@@ -4,10 +4,10 @@
 // @version      1.8.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
-// @homepageURL  https://github.com/__GH_USER__/__REPO__
-// @supportURL   https://github.com/__GH_USER__/__REPO__/issues
-// @updateURL    https://raw.githubusercontent.com/__GH_USER__/__REPO__/main/torn-foreign-stock-itinerary.user.js
-// @downloadURL  https://raw.githubusercontent.com/__GH_USER__/__REPO__/main/torn-foreign-stock-itinerary.user.js
+// @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
+// @supportURL   https://github.com/mat-mcc-uk/torn-stock-itinerary/issues
+// @updateURL    https://raw.githubusercontent.com/mat-mcc-uk/torn-stock-itinerary/main/torn-foreign-stock-itinerary.user.js
+// @downloadURL  https://raw.githubusercontent.com/mat-mcc-uk/torn-stock-itinerary/main/torn-foreign-stock-itinerary.user.js
 // @match        https://www.torn.com/page.php?sid=travel*
 // @connect      yata.yt
 // @connect      api.torn.com
