@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.13.0
+// @version      1.14.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -698,21 +698,44 @@
     /* When collapsed, only the header bar shows. */
     #tsi-panel.tsi-collapsed { overflow: hidden; }
     #tsi-panel.tsi-collapsed .tsi-body { display: none; }
-    /* Narrow screens (PDA / mobile): dock near the bottom, full width. Lift it
-       above PDA's bottom tab bar (the building/gym/globe/box icon row) plus the
-       device safe-area inset, so the panel isn't hidden behind those tabs.
-       PDA_TAB_CLEARANCE below is the gap; raise it if your tab bar is taller. */
+    /* Title swap: full name normally, short name when collapsed to a pill. */
+    #tsi-panel .tsi-title-short { display: none; }
+    #tsi-panel.tsi-collapsed .tsi-title-full { display: none; }
+    #tsi-panel.tsi-collapsed .tsi-title-short { display: inline; }
+    /* Narrow screens (PDA / mobile). Collapsed: a compact pill on the right so
+       it doesn't cover the flight timer. Expanded: docks full width above the
+       bottom tab bar. The clearance (64px) clears PDA's tab row plus safe area;
+       raise it if your tab bar is taller. */
     @media (max-width: 784px) {
       #tsi-panel {
         top: auto;
         bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+        right: 6px;
+        left: auto;
+        width: auto;
+        max-width: calc(100vw - 12px);
+        max-height: 50vh;
+        border-radius: 6px;
+      }
+      /* Expanded on narrow: span the full width and round only the top. */
+      #tsi-panel:not(.tsi-collapsed) {
         right: 0;
         left: 0;
         width: 100%;
         max-width: 100%;
-        max-height: 50vh;
         border-radius: 6px 6px 0 0;
       }
+      /* Collapsed pill: tighten the header so it reads as a small button. */
+      #tsi-panel.tsi-collapsed h3 {
+        padding: 8px 12px;
+        font-size: 13px;
+      }
+      #tsi-panel.tsi-collapsed h3 > span:first-child {
+        margin-right: 6px;
+      }
+      /* Short title only in the collapsed pill; gear is useless there. */
+      #tsi-panel.tsi-collapsed .tsi-gear-wrap,
+      #tsi-panel.tsi-collapsed #tsi-gear { display: none; }
     }
     #tsi-panel h3 {
       margin: 0;
@@ -800,7 +823,8 @@
     panel.id = 'tsi-panel';
     panel.innerHTML = `
       <h3>
-        <span>Foreign Stock Itinerary</span>
+        <span class="tsi-title-full">Foreign Stock Itinerary</span>
+        <span class="tsi-title-short">Stock</span>
         <span>
           <button class="tsi-toggle" id="tsi-gear" title="Settings">⚙</button>
           <button class="tsi-toggle" id="tsi-collapse">_</button>
