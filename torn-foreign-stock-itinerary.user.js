@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.10.0
+// @version      1.11.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
 // @supportURL   https://github.com/mat-mcc-uk/torn-stock-itinerary/issues
 // @updateURL    https://raw.githubusercontent.com/mat-mcc-uk/torn-stock-itinerary/main/torn-foreign-stock-itinerary.user.js
 // @downloadURL  https://raw.githubusercontent.com/mat-mcc-uk/torn-stock-itinerary/main/torn-foreign-stock-itinerary.user.js
-// @match        https://www.torn.com/page.php?sid=travel*
+// @match        https://www.torn.com/*
 // @connect      yata.yt
 // @connect      api.torn.com
 // @grant        GM_xmlhttpRequest
@@ -1177,12 +1177,15 @@
   // True when the travel agency shop is actually on screen. Torn is a single
   // page app, so the URL can read sid=travel before the shop has rendered,
   // and the shop can disappear when you navigate away without a page reload.
+  // Checks the whole URL (search + hash) because PDA sometimes routes the
+  // travel page through the hash rather than the query string.
   function onTravelPage() {
-    return /[?&]sid=travel\b/.test(location.search);
+    return /[?&#]sid=travel\b/.test(location.href);
   }
 
   function ensurePanel() {
     if (!onTravelPage()) return;
+    if (!document.body) return;
     if (document.getElementById('tsi-panel')) return;
     buildPanel();
     refreshAll();
@@ -1194,15 +1197,24 @@
     // Re-inject if Torn's SPA re-renders and wipes the panel, and tear it
     // down when you leave the travel page. A single observer on body covers
     // both browser and PDA without polling.
-    const observer = new MutationObserver(() => {
-      if (onTravelPage()) {
-        ensurePanel();
-      } else {
-        const stale = document.getElementById('tsi-panel');
-        if (stale) stale.remove();
+    const startObserver = () => {
+      const target = document.body || document.documentElement;
+      if (!target) {
+        // Body not ready yet (can happen on PDA): retry shortly.
+        setTimeout(startObserver, 200);
+        return;
       }
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
+      const observer = new MutationObserver(() => {
+        if (onTravelPage()) {
+          ensurePanel();
+        } else {
+          const stale = document.getElementById('tsi-panel');
+          if (stale) stale.remove();
+        }
+      });
+      observer.observe(target, { childList: true, subtree: true });
+    };
+    startObserver();
 
     setInterval(refreshAll, REFRESH_MS);
   }
