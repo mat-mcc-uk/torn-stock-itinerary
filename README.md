@@ -81,7 +81,7 @@ Two constants near the top of the script tune the model once you've watched real
 
 ## Credits
 
-Stock data from [YATA](https://yata.yt). Built for and shared with faction members. Report problems on the [issues page](https://github.com/mat-mcc-uk/torn-stock-itinerary/issues).
+Stock data from [YATA](https://yata.yt). Built for and shared with faction members.
 
 ## License
 
