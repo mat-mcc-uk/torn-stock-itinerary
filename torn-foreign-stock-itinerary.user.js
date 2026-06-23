@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.16.0
+// @version      1.17.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -39,7 +39,7 @@
     cay: { name: 'Cayman Islands', oneWayMin: 57 },
     can: { name: 'Canada', oneWayMin: 37 },
     haw: { name: 'Hawaii', oneWayMin: 121 },
-    uki: { name: 'United Kingdom', oneWayMin: 152 },
+    uni: { name: 'United Kingdom', oneWayMin: 152 },
     arg: { name: 'Argentina', oneWayMin: 189 },
     swi: { name: 'Switzerland', oneWayMin: 169 },
     jap: { name: 'Japan', oneWayMin: 203 },
@@ -55,7 +55,7 @@
     'cayman islands': 'cay',
     'canada': 'can',
     'hawaii': 'haw',
-    'united kingdom': 'uki',
+    'united kingdom': 'uni',
     'argentina': 'arg',
     'switzerland': 'swi',
     'japan': 'jap',
