@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.14.0
+// @version      1.16.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -116,6 +116,9 @@
   let watchlist = GM_getValue('watchlist', DEFAULT_WATCHLIST);
   let watchlistFilter = GM_getValue('watchlistFilter', false); // show only watched
   let affordFilter = GM_getValue('affordFilter', true);        // hide unaffordable
+  // Profit column display: 'hour' shows $/hr, 'trip' shows $/trip. Ranking
+  // always uses $/hr regardless, since that's the true efficiency measure.
+  let profitMode = GM_getValue('profitMode', 'hour');
   // baseCapacity = suitcase/job/faction bonuses only, NOT the travel-method +10.
   // The method's +10 is added on top at calc time so switching method is live.
   let baseCapacity = GM_getValue('baseCapacity', 5);
@@ -761,16 +764,30 @@
     #tsi-panel tr.tsi-watched { background: #2e2a14; }
     #tsi-panel .tsi-profit-pos { color: #6fcf6f; }
     #tsi-panel .tsi-profit-neg { color: #e06666; }
-    #tsi-panel input, #tsi-panel button {
+    #tsi-panel input, #tsi-panel button, #tsi-panel select {
       font-size: 11px;
       padding: 2px 5px;
       margin: 2px 0;
     }
+    #tsi-panel input, #tsi-panel select {
+      background: #2b2b2b;
+      color: #f0f0f0;
+      border: 1px solid #555;
+      border-radius: 3px;
+    }
+    #tsi-panel button {
+      background: #3a3a3a;
+      color: #f0f0f0;
+      border: 1px solid #666;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+    #tsi-panel button:hover { background: #4a4a4a; }
     #tsi-panel .tsi-toggle {
       cursor: pointer;
       background: none;
       border: none;
-      color: #aaa;
+      color: #ccc;
       font-size: 14px;
     }
     #tsi-panel .tsi-status { color: #888; font-size: 11px; margin-bottom: 6px; }
@@ -863,6 +880,13 @@
             </label>
           </div>
           <div>
+            Show profit as:
+            <select id="tsi-profitmode" style="width:120px">
+              <option value="hour"${profitMode === 'hour' ? ' selected' : ''}>Per hour</option>
+              <option value="trip"${profitMode === 'trip' ? ' selected' : ''}>Per trip</option>
+            </select>
+          </div>
+          <div>
             Country:
             <select id="tsi-country" style="width:150px">
               <option value="all"${countryFilter === 'all' ? ' selected' : ''}>All countries</option>
@@ -906,7 +930,7 @@
         <table id="tsi-table">
           <thead>
             <tr>
-              <th>Fly?</th><th>Item</th><th>Stock</th><th>$/hr</th>
+              <th>Fly?</th><th>Item</th><th>Stock</th><th id="tsi-profit-head">$/hr</th>
               <th class="tsi-col-extra">Country</th>
               <th class="tsi-col-extra">Restock</th>
               <th class="tsi-col-extra">RT</th>
@@ -994,6 +1018,12 @@
     document.getElementById('tsi-affordfilter').addEventListener('change', (e) => {
       affordFilter = e.target.checked;
       GM_setValue('affordFilter', affordFilter);
+      renderTable();
+    });
+
+    document.getElementById('tsi-profitmode').addEventListener('change', (e) => {
+      profitMode = e.target.value;
+      GM_setValue('profitMode', profitMode);
       renderTable();
     });
 
@@ -1129,11 +1159,16 @@
     const tbody = document.getElementById('tsi-tbody');
     if (!tbody) return;
 
+    // Swap the profit column header to match the chosen display mode.
+    const profitHead = document.getElementById('tsi-profit-head');
+    if (profitHead) profitHead.textContent = profitMode === 'trip' ? '$/trip' : '$/hr';
+
     tbody.innerHTML = rows
       .slice(0, 50)
       .map((r) => {
+        const profitVal = profitMode === 'trip' ? r.profitPerTrip : r.profitPerHour;
         const profitClass =
-          r.profitPerHour === null ? '' : r.profitPerHour >= 0 ? 'tsi-profit-pos' : 'tsi-profit-neg';
+          profitVal === null ? '' : profitVal >= 0 ? 'tsi-profit-pos' : 'tsi-profit-neg';
         const key = r.countryCode + ':' + r.itemId;
         const isOpen = expandedCharts.has(key);
         const mainRow = `
@@ -1141,7 +1176,7 @@
             <td>${verdictCell(r.verdict)}</td>
             <td>${r.item}${r.isWatched ? ' ★' : ''}</td>
             <td>${r.quantity}${r.cashLimited ? ` <span style="color:#f0d27a" title="Cash only covers ${r.itemsAvailable}">(buy ${r.itemsAvailable})</span>` : ''}</td>
-            <td class="${profitClass}">${formatMoney(r.profitPerHour)}</td>
+            <td class="${profitClass}">${formatMoney(profitVal)}</td>
             <td class="tsi-col-extra">${r.country}</td>
             <td class="tsi-col-extra">${restockCell(r, now)}</td>
             <td class="tsi-col-extra">${formatTime(r.roundTripMin)}</td>
@@ -1171,7 +1206,9 @@
         const watchedGo = goRows.filter((r) => r.isWatched);
         const pick = (watchedGo.length ? watchedGo : goRows)[0];
         best.style.display = 'block';
-        best.innerHTML = `<strong>Fly now:</strong> ${pick.item} in ${pick.country}. ${pick.verdict.reason}, ${formatMoney(pick.profitPerHour)}/hr`;
+        const pickVal = profitMode === 'trip' ? pick.profitPerTrip : pick.profitPerHour;
+        const pickUnit = profitMode === 'trip' ? '/trip' : '/hr';
+        best.innerHTML = `<strong>Fly now:</strong> ${pick.item} in ${pick.country}. ${pick.verdict.reason}, ${formatMoney(pickVal)}${pickUnit}`;
       } else {
         best.style.display = 'none';
       }
