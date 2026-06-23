@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.18.0
+// @version      1.19.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -771,6 +771,16 @@
     #tsi-panel tr.tsi-watched { background: #2e2a14; }
     #tsi-panel .tsi-profit-pos { color: #6fcf6f; }
     #tsi-panel .tsi-profit-neg { color: #e06666; }
+    #tsi-panel .tsi-ccode {
+      display: inline-block;
+      font-family: monospace;
+      font-size: 10px;
+      color: #9fb8e8;
+      background: #2b3340;
+      padding: 0 3px;
+      border-radius: 3px;
+      vertical-align: middle;
+    }
     #tsi-panel input, #tsi-panel button, #tsi-panel select {
       font-size: 11px;
       padding: 2px 5px;
@@ -1181,7 +1191,7 @@
         const mainRow = `
           <tr class="tsi-item-row ${r.isWatched ? 'tsi-watched' : ''}" data-key="${key}">
             <td>${verdictCell(r.verdict)}</td>
-            <td>${r.item}${r.isWatched ? ' ★' : ''}</td>
+            <td><span class="tsi-ccode">${r.countryCode.toUpperCase()}</span> ${r.item}${r.isWatched ? ' ★' : ''}</td>
             <td>${r.quantity}${r.cashLimited ? ` <span style="color:#f0d27a" title="Cash only covers ${r.itemsAvailable}">(buy ${r.itemsAvailable})</span>` : ''}</td>
             <td class="${profitClass}">${formatMoney(profitVal)}</td>
             <td class="tsi-col-extra">${r.country}</td>
