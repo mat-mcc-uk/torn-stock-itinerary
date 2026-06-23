@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.17.0
+// @version      1.18.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -47,6 +47,12 @@
     uae: { name: 'UAE', oneWayMin: 259 },
     sou: { name: 'South Africa', oneWayMin: 311 },
   };
+
+  // Global flight-time reduction. Torn cut all flight times by 5.26% (the new
+  // time is 18/19 of the old, i.e. multiply by 0.9474). The oneWayMin values
+  // above stay as the original documented standard times; this factor applies
+  // the cut in one place. Set back to 1 if Torn reverts it.
+  const FLIGHT_TIME_MULT = 0.9474;
 
   // Maps the Torn API's travel.destination strings to our country codes.
   // The API uses full official names which differ from our short labels.
@@ -131,10 +137,11 @@
   }
 
   // Effective one-way minutes for a country under current method + book.
+  // FLIGHT_TIME_MULT applies Torn's global flight-time reduction first.
   function effectiveOneWay(oneWayMin) {
     let mult = TRAVEL_METHODS[travelMethod].timeMult;
     if (mailingBook) mult *= MAILING_BOOK_MULT;
-    return oneWayMin * mult;
+    return oneWayMin * FLIGHT_TIME_MULT * mult;
   }
 
   // ---------------------------------------------------------------------
