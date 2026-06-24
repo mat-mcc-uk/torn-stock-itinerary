@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.23.0
+// @version      1.24.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -200,9 +200,8 @@
   // Fetch the lowest live Item Market listing price for one item. Returns the
   // price in dollars or null on failure. Caches the result in livePriceCache
   // so repeated opens don't make extra calls. Costs one API call per item.
-  // Uses API v2 (itemmarket is v2-only). v2 requires the key as an
-  // Authorization header, not a query parameter. limit=1 fetches only the
-  // cheapest listing, saving bandwidth.
+  // Handles both v1-style (cost/quantity) and v2-style (price/amount) field
+  // names since the API has shifted between them.
   async function fetchLivePrice(itemId) {
     if (!TORN_API_KEY) return null;
     try {
@@ -215,12 +214,35 @@
         console.warn('Live price fetch failed:', msg);
         return { error: msg };
       }
-      const listings = data.itemmarket;
-      if (!Array.isArray(listings) || listings.length === 0) {
-        return { error: 'No listings found' };
+
+      // The response may wrap listings under `itemmarket`, `listings`, or sit
+      // at the top level. Try each and pick the first that yields an array.
+      let listings = data.itemmarket || data.listings;
+      if (!Array.isArray(listings) && typeof listings === 'object' && listings) {
+        listings = Object.values(listings);
       }
-      const lowest = Math.min(...listings.map((l) => l.cost).filter((c) => c > 0));
-      if (!isFinite(lowest)) return { error: 'No valid prices found' };
+      // Last resort: maybe the response itself is the array.
+      if (!Array.isArray(listings) && Array.isArray(data)) {
+        listings = data;
+      }
+
+      if (!Array.isArray(listings) || listings.length === 0) {
+        console.warn('Live price response shape unexpected. Keys:', Object.keys(data));
+        console.warn('Full response (first 500 chars):', JSON.stringify(data).slice(0, 500));
+        return { error: 'No listings found (check console)' };
+      }
+
+      // Each listing may use `cost` (v1-style) or `price` (v2-style).
+      const prices = listings
+        .map((l) => (typeof l.cost === 'number' ? l.cost : l.price))
+        .filter((c) => typeof c === 'number' && c > 0);
+
+      if (prices.length === 0) {
+        console.warn('Live price listings had no usable price field. Sample:', listings[0]);
+        return { error: 'No valid prices in listings' };
+      }
+
+      const lowest = Math.min(...prices);
       livePriceCache[itemId] = lowest;
       return { price: lowest };
     } catch (err) {
