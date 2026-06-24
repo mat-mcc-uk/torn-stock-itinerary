@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.20.0
+// @version      1.21.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -200,6 +200,7 @@
   // Fetch the lowest live Item Market listing price for one item. Returns the
   // price in dollars or null on failure. Caches the result in livePriceCache
   // so repeated opens don't make extra calls. Costs one API call per item.
+  // The itemmarket response is an object keyed by listing ID, not an array.
   async function fetchLivePrice(itemId) {
     if (!TORN_API_KEY) return null;
     try {
@@ -207,18 +208,22 @@
         'https://api.torn.com/market/' + itemId + '?selections=itemmarket&key=' + TORN_API_KEY
       );
       if (data.error) {
-        console.warn('Live price fetch failed:', data.error.error);
-        return null;
+        const msg = 'API error ' + data.error.code + ': ' + data.error.error;
+        console.warn('Live price fetch failed:', msg);
+        return { error: msg };
       }
-      // itemmarket is an array of listings sorted ascending by price.
       const listings = data.itemmarket;
-      if (!Array.isArray(listings) || listings.length === 0) return null;
-      const lowest = listings[0].cost;
+      // itemmarket is an object keyed by listing ID, not a sorted array.
+      // Find the minimum cost across all entries.
+      if (!listings || typeof listings !== 'object') return { error: 'No listings found' };
+      const costs = Object.values(listings).map((l) => l.cost).filter((c) => c > 0);
+      if (costs.length === 0) return { error: 'No listings found' };
+      const lowest = Math.min(...costs);
       livePriceCache[itemId] = lowest;
-      return lowest;
+      return { price: lowest };
     } catch (err) {
       console.warn('Live price fetch error:', err);
-      return null;
+      return { error: err.message || 'Network error' };
     }
   }
   // money needs a Limited Access key; travel/basic are lower. If money is
@@ -1120,9 +1125,9 @@
         const itemId = parseInt(priceBtn.dataset.itemid, 10);
         priceBtn.textContent = 'Fetching...';
         priceBtn.disabled = true;
-        const price = await fetchLivePrice(itemId);
-        if (price === null) {
-          priceBtn.textContent = 'Failed, try again';
+        const result = await fetchLivePrice(itemId);
+        if (!result || result.error) {
+          priceBtn.textContent = result ? result.error : 'No key set';
           priceBtn.disabled = false;
         } else {
           renderTable(); // re-render with the new cached price
