@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.22.0
+// @version      1.23.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -200,20 +200,21 @@
   // Fetch the lowest live Item Market listing price for one item. Returns the
   // price in dollars or null on failure. Caches the result in livePriceCache
   // so repeated opens don't make extra calls. Costs one API call per item.
-  // Uses API v2 — itemmarket is v2-only (error 23 on v1).
+  // Uses API v2 (itemmarket is v2-only). v2 requires the key as an
+  // Authorization header, not a query parameter. limit=1 fetches only the
+  // cheapest listing, saving bandwidth.
   async function fetchLivePrice(itemId) {
     if (!TORN_API_KEY) return null;
     try {
       const data = await gmFetch(
-        'https://api.torn.com/v2/market/' + itemId + '/itemmarket?key=' + TORN_API_KEY
+        'https://api.torn.com/v2/market/' + itemId + '/itemmarket?limit=1',
+        { headers: { 'Authorization': 'ApiKey ' + TORN_API_KEY } }
       );
       if (data.error) {
         const msg = 'API error ' + data.error.code + ': ' + data.error.error;
         console.warn('Live price fetch failed:', msg);
         return { error: msg };
       }
-      // v2 itemmarket is an array of listings: [{cost, quantity}, ...]
-      // sorted ascending by price.
       const listings = data.itemmarket;
       if (!Array.isArray(listings) || listings.length === 0) {
         return { error: 'No listings found' };
