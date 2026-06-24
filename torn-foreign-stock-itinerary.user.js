@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.19.0
+// @version      1.20.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -125,6 +125,13 @@
   // Profit column display: 'hour' shows $/hr, 'trip' shows $/trip. Ranking
   // always uses $/hr regardless, since that's the true efficiency measure.
   let profitMode = GM_getValue('profitMode', 'hour');
+  // Sell price discount applied to market_value. Torn's market_value tends to
+  // sit above what items actually sell for on the Item Market. Default 5%.
+  let sellDiscount = GM_getValue('sellDiscount', 5);
+  // Per-item live Item Market price cache. Populated on demand when the user
+  // clicks "Fetch live price" on a chart row. Keyed by itemId.
+  // Does not persist: refreshed each session, one API call per lookup.
+  const livePriceCache = {};
   // baseCapacity = suitcase/job/faction bonuses only, NOT the travel-method +10.
   // The method's +10 is added on top at calc time so switching method is live.
   let baseCapacity = GM_getValue('baseCapacity', 5);
@@ -190,7 +197,30 @@
     itemPrices = data.items || {};
   }
 
-  // One user call pulling cash, travel state, and status in a single request.
+  // Fetch the lowest live Item Market listing price for one item. Returns the
+  // price in dollars or null on failure. Caches the result in livePriceCache
+  // so repeated opens don't make extra calls. Costs one API call per item.
+  async function fetchLivePrice(itemId) {
+    if (!TORN_API_KEY) return null;
+    try {
+      const data = await gmFetch(
+        'https://api.torn.com/market/' + itemId + '?selections=itemmarket&key=' + TORN_API_KEY
+      );
+      if (data.error) {
+        console.warn('Live price fetch failed:', data.error.error);
+        return null;
+      }
+      // itemmarket is an array of listings sorted ascending by price.
+      const listings = data.itemmarket;
+      if (!Array.isArray(listings) || listings.length === 0) return null;
+      const lowest = listings[0].cost;
+      livePriceCache[itemId] = lowest;
+      return lowest;
+    } catch (err) {
+      console.warn('Live price fetch error:', err);
+      return null;
+    }
+  }
   // money needs a Limited Access key; travel/basic are lower. If money is
   // unreadable, userMoney stays null and only that filter no-ops.
   async function fetchUserState() {
@@ -477,7 +507,16 @@
         if (stockItem.quantity <= 0 && verdict.code === 'skip') continue;
 
         const marketInfo = itemPrices[stockItem.id];
-        const sellValue = marketInfo ? marketInfo.market_value : null;
+        const rawMarket = marketInfo ? marketInfo.market_value : null;
+        // Use a live-fetched Item Market price if available (fetched on demand
+        // by the user from the chart row), otherwise apply the sell discount to
+        // market_value to get a more realistic figure.
+        const livePrice = livePriceCache[stockItem.id] || null;
+        const sellValue = livePrice !== null
+          ? livePrice
+          : rawMarket !== null
+            ? rawMarket * (1 - sellDiscount / 100)
+            : null;
         const isWatched = watchlist.some(
           (w) => w.toLowerCase() === stockItem.name.toLowerCase()
         );
@@ -904,6 +943,15 @@
             </select>
           </div>
           <div>
+            Sell discount:
+            <input id="tsi-discount" type="number" min="0" max="30" step="0.5"
+                   style="width:55px" value="${sellDiscount}">
+            %
+            <span style="color:#888;font-size:10px">
+              Applied to market_value. Tap a row's Fetch price button for a live figure.
+            </span>
+          </div>
+          <div>
             Country:
             <select id="tsi-country" style="width:150px">
               <option value="all"${countryFilter === 'all' ? ' selected' : ''}>All countries</option>
@@ -1044,6 +1092,15 @@
       renderTable();
     });
 
+    document.getElementById('tsi-discount').addEventListener('input', (e) => {
+      const val = parseFloat(e.target.value);
+      if (!isNaN(val) && val >= 0 && val <= 30) {
+        sellDiscount = val;
+        GM_setValue('sellDiscount', sellDiscount);
+        renderTable();
+      }
+    });
+
     document.getElementById('tsi-country').addEventListener('change', (e) => {
       countryFilter = e.target.value;
       GM_setValue('countryFilter', countryFilter);
@@ -1052,9 +1109,26 @@
 
     document.getElementById('tsi-refresh').addEventListener('click', refreshAll);
 
-    // Toggle a per-item history chart by clicking its row. Delegation on the
-    // tbody means the single listener survives every re-render.
-    document.getElementById('tsi-tbody').addEventListener('click', (e) => {
+    // Toggle a per-item history chart by clicking its row. Also handles the
+    // "Fetch live price" button inside the chart row. Delegation on the tbody
+    // means the single listener survives every re-render.
+    document.getElementById('tsi-tbody').addEventListener('click', async (e) => {
+      // Live-price button: fetch the real Item Market price and re-render.
+      const priceBtn = e.target.closest('.tsi-live-price-btn');
+      if (priceBtn) {
+        e.stopPropagation(); // don't toggle the chart row
+        const itemId = parseInt(priceBtn.dataset.itemid, 10);
+        priceBtn.textContent = 'Fetching...';
+        priceBtn.disabled = true;
+        const price = await fetchLivePrice(itemId);
+        if (price === null) {
+          priceBtn.textContent = 'Failed, try again';
+          priceBtn.disabled = false;
+        } else {
+          renderTable(); // re-render with the new cached price
+        }
+        return;
+      }
       const row = e.target.closest('tr.tsi-item-row');
       if (!row) return;
       const key = row.dataset.key;
@@ -1189,7 +1263,7 @@
         const key = r.countryCode + ':' + r.itemId;
         const isOpen = expandedCharts.has(key);
         const mainRow = `
-          <tr class="tsi-item-row ${r.isWatched ? 'tsi-watched' : ''}" data-key="${key}">
+          <tr class="tsi-item-row ${r.isWatched ? 'tsi-watched' : ''}" data-key="${key}" data-itemid="${r.itemId}">
             <td>${verdictCell(r.verdict)}</td>
             <td><span class="tsi-ccode">${r.countryCode.toUpperCase()}</span> ${r.item}${r.isWatched ? ' ★' : ''}</td>
             <td>${r.quantity}${r.cashLimited ? ` <span style="color:#f0d27a" title="Cash only covers ${r.itemsAvailable}">(buy ${r.itemsAvailable})</span>` : ''}</td>
@@ -1201,11 +1275,24 @@
         `;
         if (!isOpen) return mainRow;
         const chart = buildChartSVG(hist[key], r.pred, now);
+        const cachedPrice = livePriceCache[r.itemId];
+        const priceNote = cachedPrice
+          ? `<span style="color:#9fe8b0">Live price: ${formatMoney(cachedPrice)}</span>`
+          : `<span style="color:#888">Market value used (${sellDiscount}% discount applied)</span>`;
         const chartRow = `
           <tr class="tsi-chart-row" data-key="${key}">
             <td colspan="7" style="padding:6px 8px;background:#141414">
               <div style="font-size:11px;color:#aaa;margin-bottom:2px">
                 ${r.item} (${r.country}) stock history
+              </div>
+              <div style="font-size:11px;margin-bottom:4px;display:flex;align-items:center;gap:8px">
+                ${priceNote}
+                ${TORN_API_KEY
+                  ? `<button class="tsi-live-price-btn" data-itemid="${r.itemId}"
+                       style="font-size:10px;padding:1px 6px">
+                       ${cachedPrice ? '↻ Refresh price' : 'Fetch live price'}
+                     </button>`
+                  : ''}
               </div>
               ${chart}
             </td>
