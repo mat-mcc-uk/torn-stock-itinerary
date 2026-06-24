@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.24.0
+// @version      1.25.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -197,11 +197,11 @@
     itemPrices = data.items || {};
   }
 
-  // Fetch the lowest live Item Market listing price for one item. Returns the
-  // price in dollars or null on failure. Caches the result in livePriceCache
-  // so repeated opens don't make extra calls. Costs one API call per item.
-  // Handles both v1-style (cost/quantity) and v2-style (price/amount) field
-  // names since the API has shifted between them.
+  // Fetch the live Item Market average price for one item. The v2 endpoint
+  // returns a summary object per item with an average_price field, not
+  // individual listings. Average is actually better than lowest for a stock-
+  // running tool: the lowest single listing might be one unit at a weird
+  // price you can't fill a suitcase with.
   async function fetchLivePrice(itemId) {
     if (!TORN_API_KEY) return null;
     try {
@@ -215,36 +215,33 @@
         return { error: msg };
       }
 
-      // The response may wrap listings under `itemmarket`, `listings`, or sit
-      // at the top level. Try each and pick the first that yields an array.
-      let listings = data.itemmarket || data.listings;
-      if (!Array.isArray(listings) && typeof listings === 'object' && listings) {
-        listings = Object.values(listings);
+      // Response wraps summary objects under itemmarket/listings, or sits at
+      // the top level. Find whichever key holds an array.
+      let entries = data.itemmarket || data.listings;
+      if (!Array.isArray(entries) && typeof entries === 'object' && entries) {
+        entries = Object.values(entries);
       }
-      // Last resort: maybe the response itself is the array.
-      if (!Array.isArray(listings) && Array.isArray(data)) {
-        listings = data;
+      if (!Array.isArray(entries) && Array.isArray(data)) {
+        entries = data;
       }
 
-      if (!Array.isArray(listings) || listings.length === 0) {
+      if (!Array.isArray(entries) || entries.length === 0) {
         console.warn('Live price response shape unexpected. Keys:', Object.keys(data));
-        console.warn('Full response (first 500 chars):', JSON.stringify(data).slice(0, 500));
-        return { error: 'No listings found (check console)' };
+        console.warn('Full response:', JSON.stringify(data).slice(0, 800));
+        return { error: 'No data returned' };
       }
 
-      // Each listing may use `cost` (v1-style) or `price` (v2-style).
-      const prices = listings
-        .map((l) => (typeof l.cost === 'number' ? l.cost : l.price))
-        .filter((c) => typeof c === 'number' && c > 0);
-
-      if (prices.length === 0) {
-        console.warn('Live price listings had no usable price field. Sample:', listings[0]);
-        return { error: 'No valid prices in listings' };
+      // Each entry is a per-item summary: { id, name, type, average_price }.
+      // A single-item query returns one entry. Read the average_price.
+      const entry = entries[0];
+      const avg = entry.average_price;
+      if (typeof avg !== 'number' || avg <= 0) {
+        console.warn('Live price entry missing average_price. Sample:', JSON.stringify(entry));
+        return { error: 'No average_price in response' };
       }
 
-      const lowest = Math.min(...prices);
-      livePriceCache[itemId] = lowest;
-      return { price: lowest };
+      livePriceCache[itemId] = avg;
+      return { price: avg };
     } catch (err) {
       console.warn('Live price fetch error:', err);
       return { error: err.message || 'Network error' };
@@ -1306,7 +1303,7 @@
         const chart = buildChartSVG(hist[key], r.pred, now);
         const cachedPrice = livePriceCache[r.itemId];
         const priceNote = cachedPrice
-          ? `<span style="color:#9fe8b0">Live price: ${formatMoney(cachedPrice)}</span>`
+          ? `<span style="color:#9fe8b0">Market avg: ${formatMoney(cachedPrice)}</span>`
           : `<span style="color:#888">Market value used (${sellDiscount}% discount applied)</span>`;
         const chartRow = `
           <tr class="tsi-chart-row" data-key="${key}">
@@ -1319,7 +1316,7 @@
                 ${TORN_API_KEY
                   ? `<button class="tsi-live-price-btn" data-itemid="${r.itemId}"
                        style="font-size:10px;padding:1px 6px">
-                       ${cachedPrice ? '↻ Refresh price' : 'Fetch live price'}
+                       ${cachedPrice ? '↻ Refresh avg' : 'Fetch market avg'}
                      </button>`
                   : ''}
               </div>
