@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.21.0
+// @version      1.22.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -200,25 +200,26 @@
   // Fetch the lowest live Item Market listing price for one item. Returns the
   // price in dollars or null on failure. Caches the result in livePriceCache
   // so repeated opens don't make extra calls. Costs one API call per item.
-  // The itemmarket response is an object keyed by listing ID, not an array.
+  // Uses API v2 — itemmarket is v2-only (error 23 on v1).
   async function fetchLivePrice(itemId) {
     if (!TORN_API_KEY) return null;
     try {
       const data = await gmFetch(
-        'https://api.torn.com/market/' + itemId + '?selections=itemmarket&key=' + TORN_API_KEY
+        'https://api.torn.com/v2/market/' + itemId + '/itemmarket?key=' + TORN_API_KEY
       );
       if (data.error) {
         const msg = 'API error ' + data.error.code + ': ' + data.error.error;
         console.warn('Live price fetch failed:', msg);
         return { error: msg };
       }
+      // v2 itemmarket is an array of listings: [{cost, quantity}, ...]
+      // sorted ascending by price.
       const listings = data.itemmarket;
-      // itemmarket is an object keyed by listing ID, not a sorted array.
-      // Find the minimum cost across all entries.
-      if (!listings || typeof listings !== 'object') return { error: 'No listings found' };
-      const costs = Object.values(listings).map((l) => l.cost).filter((c) => c > 0);
-      if (costs.length === 0) return { error: 'No listings found' };
-      const lowest = Math.min(...costs);
+      if (!Array.isArray(listings) || listings.length === 0) {
+        return { error: 'No listings found' };
+      }
+      const lowest = Math.min(...listings.map((l) => l.cost).filter((c) => c > 0));
+      if (!isFinite(lowest)) return { error: 'No valid prices found' };
       livePriceCache[itemId] = lowest;
       return { price: lowest };
     } catch (err) {
