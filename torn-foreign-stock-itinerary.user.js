@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.1.0
+// @version      2.2.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -143,6 +143,13 @@
   // multiply the predicted-remaining count by this. Compensates for bursty
   // buyers showing up during your flight; lower = more conservative.
   const DEPLETING_SAFETY_FACTOR = 0.85;
+
+  // When current sell rate can't be measured (in-stock state, no detectable
+  // decline yet), assume the entire current stock could deplete over this
+  // many minutes. Used as a fallback so the script doesn't naively say "Go"
+  // on a long flight just because stock looks stable in a few snapshots.
+  // 60 minutes is roughly the median sellout window for active items.
+  const TYPICAL_SELLOUT_MIN = 60;
 
   // ---------------------------------------------------------------------
   // State
@@ -897,20 +904,43 @@
       };
     }
 
-    // In stock, no measurable decline: stock is sitting there to grab.
-    if (stockItem.quantity >= cap) {
+    // In stock, no measurable current decline. We can't promise the stock
+    // will survive the flight just because it isn't visibly declining right
+    // now: it might be freshly restocked and about to drop, or sell rate
+    // might be too low to detect over the few snapshots we have.
+    //
+    // Be conservative: assume the current stock could deplete over a typical
+    // sellout window. For a long flight, even a modest rate adds up to a
+    // meaningful drop. The safety factor here pushes us toward "Risky" over
+    // "Go" when uncertain, which is the right default for fly-and-can't-undo.
+    const minsToLanding = (landMs - now) / 60000;
+    const assumedRate = stockItem.quantity / TYPICAL_SELLOUT_MIN; // items/min
+    const projected = Math.max(
+      0,
+      Math.round(stockItem.quantity - assumedRate * minsToLanding * DEPLETING_SAFETY_FACTOR)
+    );
+
+    if (projected >= cap) {
       return {
         code: 'go',
         label: 'Go',
-        reason: `${stockItem.quantity} in stock, stable, grab and go`,
-        expectedStockOnArrival: stockItem.quantity,
+        reason: `${stockItem.quantity} in stock, ~${projected} likely there on arrival`,
+        expectedStockOnArrival: projected,
+      };
+    }
+    if (projected >= 1) {
+      return {
+        code: 'risky',
+        label: 'Risky',
+        reason: `${stockItem.quantity} in stock now, but only ~${projected} likely there after a ${formatTime(minsToLanding)} flight`,
+        expectedStockOnArrival: projected,
       };
     }
     return {
-      code: 'risky',
-      label: 'Risky',
-      reason: `Only ${stockItem.quantity} in stock, partial load`,
-      expectedStockOnArrival: stockItem.quantity,
+      code: 'skip',
+      label: 'No fly',
+      reason: `${stockItem.quantity} in stock now but likely empty after a ${formatTime(minsToLanding)} flight`,
+      expectedStockOnArrival: 0,
     };
   }
 
