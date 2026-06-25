@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.0.0
+// @version      2.1.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -180,11 +180,30 @@
   }
 
   // Effective one-way minutes for a country under current method + book.
-  // FLIGHT_TIME_MULT applies Torn's global flight-time reduction first.
-  function effectiveOneWay(oneWayMin) {
+  // Reads the observed flight-time cache first, falling back to the formula
+  // (oneWayMin × FLIGHT_TIME_MULT × method × book) when no observation yet.
+  // The cache is keyed per country/method/book so calibration is exact.
+  function effectiveOneWay(codeOrMin) {
+    // Backward-compat: callers may still pass a raw oneWayMin number (the
+    // ranking loop does). When given a string country code we use the cache.
+    if (typeof codeOrMin === 'string') {
+      const code = codeOrMin;
+      const key = code + ':' + travelMethod + (mailingBook ? ':book' : '');
+      const observed = observedFlightTimes[key];
+      if (typeof observed === 'number' && observed > 0) {
+        return observed;
+      }
+      // No observation: fall back to formula.
+      const country = COUNTRIES[code];
+      if (!country) return 0;
+      let mult = TRAVEL_METHODS[travelMethod].timeMult;
+      if (mailingBook) mult *= MAILING_BOOK_MULT;
+      return country.oneWayMin * FLIGHT_TIME_MULT * mult;
+    }
+    // Numeric input: legacy formula path (no code, can't check cache).
     let mult = TRAVEL_METHODS[travelMethod].timeMult;
     if (mailingBook) mult *= MAILING_BOOK_MULT;
-    return oneWayMin * FLIGHT_TIME_MULT * mult;
+    return codeOrMin * FLIGHT_TIME_MULT * mult;
   }
 
   // ---------------------------------------------------------------------
@@ -218,6 +237,15 @@
   // Timestamp YATA reported with its last export, in ms. Used to show data
   // age in the status bar; null if not available.
   let yataExportMs = null;
+
+  // Observed one-way flight times in minutes, learned from your actual
+  // flights. Keyed by "countryCode:method" (e.g. "mex:airstrip"). When a
+  // calibrated value is present, it overrides the hardcoded fallback.
+  // Persisted across sessions so calibration accumulates over time.
+  let observedFlightTimes = GM_getValue('observedFlightTimes', {});
+  // Tracks the most recent flight we calibrated against so we don't re-record
+  // the same flight on every poll. Just the destination + departed timestamp.
+  let lastCalibratedFlight = null;
 
   async function fetchStockData() {
     const data = await gmFetch('https://yata.yt/api/v1/travel/export/');
@@ -329,6 +357,28 @@
     const destName = (travel.destination || '').toLowerCase();
     const destCode = DEST_TO_CODE[destName];
 
+    // Calibrate flight times from real flights. The API gives us departure
+    // (`departed`) and arrival (`timestamp`) timestamps for active flights.
+    // Their difference is the actual one-way time for the current method.
+    // Recording this lets the script learn the real numbers regardless of
+    // Torn balance changes.
+    if (
+      travel.departed &&
+      travel.timestamp &&
+      destCode &&
+      destName !== 'torn' && // outbound only; return legs aren't useful here
+      stateStr === 'traveling'
+    ) {
+      const flightId = destCode + ':' + travel.departed;
+      if (flightId !== lastCalibratedFlight) {
+        const totalMin = (travel.timestamp - travel.departed) / 60;
+        if (totalMin > 0 && totalMin < 600) { // sanity-bounded
+          recordFlightTime(destCode, travelMethod, mailingBook, totalMin);
+          lastCalibratedFlight = flightId;
+        }
+      }
+    }
+
     // Seconds left in any active flight.
     let flightLeftMin = 0;
     if (travel.timestamp) {
@@ -345,13 +395,13 @@
       } else {
         // Outbound: land abroad, then fly all the way back to Torn.
         state.location = 'outbound';
-        const back = destCode ? effectiveOneWay(COUNTRIES[destCode].oneWayMin) : 0;
+        const back = destCode ? effectiveOneWay(destCode) : 0;
         state.delayToTakeoffMin = flightLeftMin + back;
       }
     } else if (stateStr === 'abroad' || /^in /.test(state.description.toLowerCase())) {
       // Standing abroad: fly home before you can launch again.
       state.location = 'abroad';
-      const here = destCode ? effectiveOneWay(COUNTRIES[destCode].oneWayMin) : 0;
+      const here = destCode ? effectiveOneWay(destCode) : 0;
       state.delayToTakeoffMin = here;
     } else {
       // In Torn (or okay/hospital/jail at home): can take off now.
@@ -359,6 +409,21 @@
       state.delayToTakeoffMin = 0;
     }
     return state;
+  }
+
+  // Persist an observed flight time, blended with any prior observation for
+  // the same country/method/book combination. We exponentially smooth so one
+  // anomalous reading doesn't overwrite a settled estimate.
+  function recordFlightTime(code, method, withBook, observedMin) {
+    const key = code + ':' + method + (withBook ? ':book' : '');
+    const prev = observedFlightTimes[key];
+    const blended = prev == null ? observedMin : prev * 0.5 + observedMin * 0.5;
+    observedFlightTimes[key] = blended;
+    GM_setValue('observedFlightTimes', observedFlightTimes);
+    console.log(
+      `Calibrated flight time ${key}: ${observedMin.toFixed(2)}m ` +
+      `(stored ${blended.toFixed(2)}m, was ${prev == null ? 'unset' : prev.toFixed(2) + 'm'})`
+    );
   }
 
   // ---------------------------------------------------------------------
@@ -624,7 +689,7 @@
       const entry = stockData[code];
       if (!entry || !entry.stocks) continue;
 
-      const oneWayMin = effectiveOneWay(country.oneWayMin);
+      const oneWayMin = effectiveOneWay(code);
       const roundTripMin = oneWayMin * 2;
       const roundTripHours = roundTripMin / 60;
 
@@ -1143,6 +1208,13 @@
             <button id="tsi-refresh">Refresh now</button>
           </div>
           <div>
+            <span id="tsi-calibration-status" style="color:#888;font-size:10px"></span>
+            <button id="tsi-clear-calibration" style="font-size:10px">Clear calibration</button>
+            <span style="color:#888;font-size:10px">
+              Flight times auto-calibrate from your real trips. Clear to start over.
+            </span>
+          </div>
+          <div>
             <button id="tsi-reset-data" style="background:#4a2424;border-color:#7a3838">Reset cached data</button>
             <span style="color:#888;font-size:10px">
               Clears stock history and live prices. Use if predictions are stuck
@@ -1307,6 +1379,17 @@
       for (const k of Object.keys(livePriceCache)) delete livePriceCache[k];
       expandedCharts.clear();
       saveExpandedCharts();
+      renderTable();
+    });
+
+    document.getElementById('tsi-clear-calibration').addEventListener('click', () => {
+      if (!confirm(
+        'Clear all calibrated flight times? The script will fall back to '
+          + 'estimated times until you fly again. Flight times will recalibrate '
+          + 'automatically as you make new trips.'
+      )) return;
+      observedFlightTimes = {};
+      GM_setValue('observedFlightTimes', observedFlightTimes);
       renderTable();
     });
 
@@ -1511,6 +1594,7 @@
     dom.money = document.getElementById('tsi-money');
     dom.location = document.getElementById('tsi-location');
     dom.status = document.getElementById('tsi-status');
+    dom.calibrationStatus = document.getElementById('tsi-calibration-status');
   }
 
   function renderTable(hist, now) {
@@ -1599,6 +1683,15 @@
       dom.effcap.textContent = `(carrying ${effectiveCapacity()} with ${
         TRAVEL_METHODS[travelMethod].name
       })`;
+    }
+
+    if (dom.calibrationStatus) {
+      // Count how many countries have a calibrated time for current method+book.
+      const suffix = ':' + travelMethod + (mailingBook ? ':book' : '');
+      const calibrated = Object.keys(observedFlightTimes).filter((k) => k.endsWith(suffix)).length;
+      const total = Object.keys(COUNTRIES).length;
+      dom.calibrationStatus.textContent =
+        `Calibrated: ${calibrated}/${total} countries for ${TRAVEL_METHODS[travelMethod].name}${mailingBook ? ' + book' : ''}. `;
     }
 
     if (dom.money) {
