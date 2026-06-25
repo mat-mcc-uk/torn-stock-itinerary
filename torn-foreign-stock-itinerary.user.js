@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.3.0
+// @version      2.4.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -976,7 +976,9 @@
   GM_addStyle(`
     #tsi-panel {
       position: fixed;
-      top: 80px;
+      /* Dock to bottom-right above Torn's chat tabs (~50px tall). Avoids
+         covering the Return home button which lives in the top-right. */
+      bottom: 50px;
       right: 10px;
       width: 420px;
       max-width: calc(100vw - 20px);
@@ -1276,9 +1278,10 @@
     document.body.appendChild(panel);
 
     // Collapse by tapping the header (better touch target than a small button).
-    // Start collapsed on narrow screens so the panel doesn't block the shop.
+    // Default to collapsed on page open so the panel doesn't cover other UI;
+    // tap the header to expand when you want to see itineraries.
     const isNarrow = window.matchMedia('(max-width: 784px)').matches;
-    if (isNarrow) panel.classList.add('tsi-collapsed');
+    panel.classList.add('tsi-collapsed');
     // Settings start open on desktop (room to spare), closed on narrow so the
     // results table is the default view. The gear toggles either way.
     if (!isNarrow) {
@@ -1293,8 +1296,8 @@
       // for the next interval tick.
       if (!collapsed) refreshAll();
     });
-    // Reflect initial state in the button glyph.
-    document.getElementById('tsi-collapse').textContent = isNarrow ? '▲' : '▼';
+    // Reflect initial collapsed state in the button glyph.
+    document.getElementById('tsi-collapse').textContent = '▲';
 
     // Gear toggles the settings section. Stop the click bubbling to the header
     // so it doesn't also collapse the whole panel.
