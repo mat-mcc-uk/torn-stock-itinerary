@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.2.0
+// @version      2.3.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -150,6 +150,13 @@
   // on a long flight just because stock looks stable in a few snapshots.
   // 60 minutes is roughly the median sellout window for active items.
   const TYPICAL_SELLOUT_MIN = 60;
+
+  // When a depleting item's projected empty time is further out than this,
+  // display "stable" instead of a specific countdown. The underlying
+  // calculation may produce big numbers from noisy slow-mover data, and any
+  // prediction more than a day out will be invalidated by the next restock
+  // before it could ever come true.
+  const LONG_ETA_THRESHOLD_MIN = 24 * 60;
 
   // ---------------------------------------------------------------------
   // State
@@ -1517,6 +1524,11 @@
       return `${earliest}–${latest} ${tag}`;
     }
     if (p.state === 'depleting' && p.etaEmptyMin != null) {
+      // Very long projections (more than a day out) carry false precision:
+      // the underlying rate is dominated by noise on slow movers, and any
+      // restock will invalidate the number long before it comes true.
+      // Treat these as effectively stable.
+      if (p.etaEmptyMin > LONG_ETA_THRESHOLD_MIN) return 'stable';
       return 'empties ' + fmtCountdown(now + p.etaEmptyMin * 60000, now);
     }
     if (p.state === 'learning') return '—';
