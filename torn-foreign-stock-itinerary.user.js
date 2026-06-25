@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      1.25.0
+// @version      2.0.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -98,7 +98,11 @@
   const HISTORY_KEY = 'stockHistory';
   const HISTORY_WINDOW_MS = 48 * 60 * 60 * 1000; // keep 48h per item
   const RESTOCK_TICK_MIN = 15;                   // quarter-hour grid
-  const RESTOCK_RATIO = 0.5;                      // refill ≈ half sell-out time
+  // Restock-time heuristic: refill takes roughly (sellout duration × ratio).
+  // 0.5 was the community-accepted value pre-December-2025. Torn changed
+  // restock mechanics in that update and the new ratio varies by item, so
+  // this is now user-tunable in settings.
+  let restockRatio = GM_getValue('restockRatio', 0.5);
   const MIN_POINTS_FOR_FIT = 4;                   // need this many to trust a rate
   const MIN_DECLINE_FOR_FIT = 30;                 // and this much total drop (items)
 
@@ -107,6 +111,38 @@
   // you land is a no-fly. This is the max seconds you'd tolerate waiting; set
   // to 15 to match the post-arrival grace period, effectively "no waiting".
   const MAX_WAIT_SEC = 15;
+
+  // ---------------------------------------------------------------------
+  // Tunable constants (previously magic numbers scattered through the code)
+  // ---------------------------------------------------------------------
+
+  // Skip recording a new snapshot if quantity hasn't changed within this
+  // window. Keeps the time series compact without losing real transitions.
+  const SNAPSHOT_DEDUPE_MS = 90 * 1000;
+
+  // Treat stock <= ceil(max(1, peak * NEAR_ZERO_FRACTION)) as "sold out"
+  // when measuring a sellout cycle. Allows for a stray reading or two of
+  // residual stock that other players haven't grabbed.
+  const NEAR_ZERO_FRACTION = 0.02;
+
+  // Bounds on the user-tunable restock ratio. 0.1 to 2.0 covers plausible
+  // values; outside this we ignore the input as a typo.
+  const RESTOCK_RATIO_MIN = 0.1;
+  const RESTOCK_RATIO_MAX = 2.0;
+
+  // Confidence thresholds for empty-state predictions (history points).
+  const CONF_HIGH_POINTS = 20;
+  const CONF_MEDIUM_POINTS = 10;
+
+  // MutationObserver fires hundreds of times per second on a busy page.
+  // Debounce its handler so we don't run our cheap-but-not-free checks on
+  // every micro-mutation Torn's SPA does.
+  const OBSERVER_DEBOUNCE_MS = 250;
+
+  // Safety margin: when projecting stock at landing on a depleting item,
+  // multiply the predicted-remaining count by this. Compensates for bursty
+  // buyers showing up during your flight; lower = more conservative.
+  const DEPLETING_SAFETY_FACTOR = 0.85;
 
   // ---------------------------------------------------------------------
   // State
@@ -179,9 +215,14 @@
     });
   }
 
+  // Timestamp YATA reported with its last export, in ms. Used to show data
+  // age in the status bar; null if not available.
+  let yataExportMs = null;
+
   async function fetchStockData() {
     const data = await gmFetch('https://yata.yt/api/v1/travel/export/');
     stockData = data.stocks || {};
+    yataExportMs = typeof data.timestamp === 'number' ? data.timestamp * 1000 : null;
     return data.timestamp;
   }
 
@@ -328,15 +369,23 @@
   //   { "chi:264": [[tsMs, qty], [tsMs, qty], ...], ... }
   // Key is countryCode:itemId. Arrays are time-ordered, oldest first.
 
+  // History is held in memory after first load and persisted to GM storage on
+  // each snapshot. This avoids parsing/stringifying the whole blob on every
+  // render call, which would otherwise happen many times per refresh.
+  let historyCache = null;
+
   function loadHistory() {
+    if (historyCache !== null) return historyCache;
     try {
-      return JSON.parse(GM_getValue(HISTORY_KEY, '{}'));
+      historyCache = JSON.parse(GM_getValue(HISTORY_KEY, '{}'));
     } catch {
-      return {};
+      historyCache = {};
     }
+    return historyCache;
   }
 
   function saveHistory(hist) {
+    historyCache = hist; // keep cache in sync
     try {
       GM_setValue(HISTORY_KEY, JSON.stringify(hist));
     } catch (err) {
@@ -369,9 +418,9 @@
         const series = hist[key];
         const last = series[series.length - 1];
 
-        // Skip duplicate consecutive readings (same qty within 90s) to keep
-        // the series compact; still captures every real change.
-        if (last && last[1] === stockItem.quantity && now - last[0] < 90 * 1000) {
+        // Skip duplicate consecutive readings (same qty within dedupe window)
+        // to keep the series compact; still captures every real change.
+        if (last && last[1] === stockItem.quantity && now - last[0] < SNAPSHOT_DEDUPE_MS) {
           continue;
         }
         series.push([now, stockItem.quantity]);
@@ -395,8 +444,12 @@
     return d.getTime();
   }
 
-  // Linear fit over the most recent monotonically-declining run, returning
-  // items sold per minute (positive number) or null if not enough signal.
+  // Recency-weighted least-squares fit over the current decline run.
+  // Returns items sold per minute (positive number) or null if not enough
+  // signal. Weights drop exponentially with age so a sudden shift in sell
+  // rate (e.g. a faction running the route) shows up sooner.
+  // Half-life of the weight is the run duration / 3, so the most recent
+  // third of the run dominates.
   function sellRatePerMin(series) {
     if (!series || series.length < MIN_POINTS_FOR_FIT) return null;
 
@@ -412,42 +465,83 @@
     const drop = run[0][1] - run[run.length - 1][1];
     if (drop < MIN_DECLINE_FOR_FIT) return null;
 
-    // Least-squares slope of qty vs minutes.
-    const t0 = run[0][0];
-    const xs = run.map((p) => (p[0] - t0) / 60000);
-    const ys = run.map((p) => p[1]);
-    const n = xs.length;
-    const sx = xs.reduce((a, b) => a + b, 0);
-    const sy = ys.reduce((a, b) => a + b, 0);
-    const sxx = xs.reduce((a, b) => a + b * b, 0);
-    const sxy = xs.reduce((a, b, i) => a + b * ys[i], 0);
-    const denom = n * sxx - sx * sx;
+    // Weighted least-squares slope of qty vs minutes. Weight by age, with
+    // half-life = runDurationMin / 3. So a point taken at the start of the
+    // run has weight 1/8 relative to a point taken now.
+    const tEnd = run[run.length - 1][0];
+    const runDurationMin = (tEnd - run[0][0]) / 60000;
+    const halfLifeMin = Math.max(1, runDurationMin / 3);
+    const decay = Math.LN2 / halfLifeMin;
+
+    let sw = 0, swx = 0, swy = 0, swxx = 0, swxy = 0;
+    for (const [t, q] of run) {
+      const xMin = (t - run[0][0]) / 60000;
+      const ageMin = (tEnd - t) / 60000;
+      const w = Math.exp(-decay * ageMin);
+      sw += w;
+      swx += w * xMin;
+      swy += w * q;
+      swxx += w * xMin * xMin;
+      swxy += w * xMin * q;
+    }
+    const denom = sw * swxx - swx * swx;
     if (denom === 0) return null;
-    const slope = (n * sxy - sx * sy) / denom; // qty change per minute
+    const slope = (sw * swxy - swx * swy) / denom; // qty change per minute
     if (slope >= 0) return null; // not declining
     return -slope; // sold per minute
   }
 
-  // Measure how long the last completed sell-out cycle took (minutes), from a
-  // post-restock peak down to zero/near-zero. Used to size the restock wait.
-  function lastSelloutDurationMin(series) {
+  // Measure the most recent completed sell-out cycle in the series. Walks
+  // backwards from "now" to find a near-zero reading, then back further to
+  // the peak that preceded it. Returns { durationMin, peak } or null if no
+  // complete cycle is logged.
+  // Using the most recent cycle (not the global peak) means a one-off freak
+  // high reading or a stale pre-update peak doesn't poison the prediction.
+  function lastSellout(series) {
     if (!series || series.length < MIN_POINTS_FOR_FIT) return null;
-    let peakIdx = -1;
-    let peakVal = -1;
-    // Find a peak followed later by a near-zero.
-    for (let i = 0; i < series.length; i++) {
+
+    // Find the most recent index where stock was near zero.
+    let zeroIdx = -1;
+    for (let i = series.length - 1; i >= 0; i--) {
+      // Threshold is set by the eventual peak we'll find; use 0 to start and
+      // refine. A simple two-pass would be slow on long series, so we go in
+      // one pass with a generous bound: treat <=1 as effectively empty here.
+      if (series[i][1] <= 1) {
+        zeroIdx = i;
+        break;
+      }
+    }
+    if (zeroIdx <= 0) return null;
+
+    // Walk further back to find the peak that preceded this zero.
+    let peakIdx = zeroIdx;
+    let peakVal = series[zeroIdx][1];
+    for (let i = zeroIdx - 1; i >= 0; i--) {
       if (series[i][1] > peakVal) {
         peakVal = series[i][1];
         peakIdx = i;
+      } else if (i > 0 && series[i][1] < series[i - 1][1]) {
+        // Stock rises going backwards: we've crossed a previous restock.
+        // Stop here so we measure THIS cycle, not the one before it.
+        break;
       }
     }
-    if (peakIdx < 0) return null;
-    for (let j = peakIdx + 1; j < series.length; j++) {
-      if (series[j][1] <= Math.max(1, peakVal * 0.02)) {
-        return (series[j][0] - series[peakIdx][0]) / 60000;
+    if (peakIdx === zeroIdx) return null;
+
+    // Refine the zero threshold using the peak we found, in case the cycle
+    // hit "near zero" rather than absolute zero.
+    const threshold = Math.max(1, peakVal * NEAR_ZERO_FRACTION);
+    let refinedZeroIdx = zeroIdx;
+    for (let i = peakIdx + 1; i < series.length; i++) {
+      if (series[i][1] <= threshold) {
+        refinedZeroIdx = i;
+        break;
       }
     }
-    return null;
+
+    const durationMin = (series[refinedZeroIdx][0] - series[peakIdx][0]) / 60000;
+    if (durationMin <= 0) return null;
+    return { durationMin, peak: peakVal };
   }
 
   // Produce a prediction object for one item's series given current qty.
@@ -459,6 +553,7 @@
       sellRate: null,
       etaEmptyMin: null,
       nextRestockMs: null,
+      rawRestockMs: null,
       restockPeak: null,
       confidence: 'low',
     };
@@ -467,21 +562,32 @@
     const qty = series[series.length - 1][1];
     const rate = sellRatePerMin(series);
     result.sellRate = rate;
-    // Highest stock seen: a stand-in for how much a fresh restock puts on the
-    // shelf. Used to project stock when an empty item refills mid-flight.
-    result.restockPeak = Math.max(...series.map((p) => p[1]));
+
+    // Use the most recent observed sellout cycle to seed both the restock
+    // peak (how much a fresh refill puts on the shelf) and the wait time.
+    // Falls back to current quantity if no full cycle is logged yet.
+    const recent = lastSellout(series);
+    result.restockPeak = recent ? recent.peak : Math.max(qty, 0);
 
     if (qty <= 0) {
       result.state = 'empty';
-      // Restock ≈ half the last sell-out duration, snapped to a tick.
-      const sellout = lastSelloutDurationMin(series);
+      // Restock = (last sellout duration × restockRatio), snapped to a tick.
+      // We keep both the raw prediction and the snapped value: the snapped
+      // time is what the script acts on (restocks really do fire on ticks),
+      // the raw time drives confidence and range display.
       const emptiedAt = series[series.length - 1][0];
-      if (sellout) {
-        const waitMin = sellout * RESTOCK_RATIO;
-        result.nextRestockMs = nextTick(emptiedAt + waitMin * 60000);
-        result.confidence = 'medium';
+      if (recent) {
+        const waitMin = recent.durationMin * restockRatio;
+        result.rawRestockMs = emptiedAt + waitMin * 60000;
+        result.nextRestockMs = nextTick(result.rawRestockMs);
+        // Confidence rises with how many sell-out cycles have been observed,
+        // since restockRatio is a population guess that varies per item.
+        result.confidence = series.length >= CONF_HIGH_POINTS ? 'high'
+          : series.length >= CONF_MEDIUM_POINTS ? 'medium'
+          : 'low';
       } else {
         // No measured cycle: fall back to the next tick as a floor.
+        result.rawRestockMs = now;
         result.nextRestockMs = nextTick(now);
         result.confidence = 'low';
       }
@@ -491,7 +597,11 @@
     if (rate && rate > 0) {
       result.state = 'depleting';
       result.etaEmptyMin = qty / rate;
-      result.confidence = series.length >= MIN_POINTS_FOR_FIT * 2 ? 'medium' : 'low';
+      // Same tiered confidence as empty state, so depleting predictions are
+      // held to the same evidence bar.
+      result.confidence = series.length >= CONF_HIGH_POINTS ? 'high'
+        : series.length >= CONF_MEDIUM_POINTS ? 'medium'
+        : 'low';
     } else {
       result.state = 'in-stock';
     }
@@ -692,10 +802,10 @@
       // Stock still on the shelf when you land (within grace): buyable now.
       if (emptyMs >= buyByMs) {
         const minsToLanding = (landMs - now) / 60000;
-        const projected = Math.max(
-          0,
-          Math.round(stockItem.quantity - pred.sellRate * minsToLanding)
-        );
+        // Apply the safety factor: assume buyers might arrive in waves during
+        // your flight so we slightly under-predict what'll be there.
+        const projectedRaw = stockItem.quantity - pred.sellRate * minsToLanding;
+        const projected = Math.max(0, Math.round(projectedRaw * DEPLETING_SAFETY_FACTOR));
         if (projected >= cap) {
           return {
             code: 'go',
@@ -745,6 +855,15 @@
       hour: '2-digit',
       minute: '2-digit',
     });
+  }
+
+  // Compact relative timestamp for chart axis. Shows "-Nh" or "-Nd" if more
+  // than a few hours back, else the clock time.
+  function fmtChartTime(tsMs, now) {
+    const ageMin = (now - tsMs) / 60000;
+    if (ageMin < 60) return Math.round(ageMin) + 'm ago';
+    if (ageMin < 24 * 60) return Math.round(ageMin / 60) + 'h ago';
+    return Math.round(ageMin / (24 * 60)) + 'd ago';
   }
 
 
@@ -883,7 +1002,6 @@
     }
     #tsi-panel .tsi-v-go { background: #1e5631; color: #9fe8b0; }
     #tsi-panel .tsi-v-risky { background: #5e4b16; color: #f0d27a; }
-    #tsi-panel .tsi-v-wait { background: #5a2424; color: #f0a0a0; }
     #tsi-panel .tsi-v-learning { background: #333; color: #999; }
     #tsi-panel .tsi-v-skip { background: #2a2a2a; color: #777; }
     #tsi-panel #tsi-bestpick { font-size: 12px; color: #cfe8d6; }
@@ -926,7 +1044,7 @@
         <span class="tsi-title-short">Stock</span>
         <span>
           <button class="tsi-toggle" id="tsi-gear" title="Settings">⚙</button>
-          <button class="tsi-toggle" id="tsi-collapse">_</button>
+          <button class="tsi-toggle" id="tsi-collapse">▼</button>
         </span>
       </h3>
       <div class="tsi-body" id="tsi-body">
@@ -978,6 +1096,14 @@
             </span>
           </div>
           <div>
+            Restock ratio:
+            <input id="tsi-restockratio" type="number" min="${RESTOCK_RATIO_MIN}" max="${RESTOCK_RATIO_MAX}" step="0.05"
+                   style="width:55px" value="${restockRatio}">
+            <span style="color:#888;font-size:10px">
+              Refill ≈ sellout × ratio. 0.5 is the old norm; Torn's Dec 2025 change altered this. Tune by observation.
+            </span>
+          </div>
+          <div>
             Country:
             <select id="tsi-country" style="width:150px">
               <option value="all"${countryFilter === 'all' ? ' selected' : ''}>All countries</option>
@@ -1016,6 +1142,13 @@
             <button id="tsi-save-capacity">Save</button>
             <button id="tsi-refresh">Refresh now</button>
           </div>
+          <div>
+            <button id="tsi-reset-data" style="background:#4a2424;border-color:#7a3838">Reset cached data</button>
+            <span style="color:#888;font-size:10px">
+              Clears stock history and live prices. Use if predictions are stuck
+              or after a big Torn update changes the underlying mechanics.
+            </span>
+          </div>
         </div>
 
         <table id="tsi-table">
@@ -1046,13 +1179,13 @@
     panel.querySelector('h3').addEventListener('click', () => {
       panel.classList.toggle('tsi-collapsed');
       const collapsed = panel.classList.contains('tsi-collapsed');
-      document.getElementById('tsi-collapse').textContent = collapsed ? '+' : '_';
+      document.getElementById('tsi-collapse').textContent = collapsed ? '▲' : '▼';
       // Expanding after a collapse: pull fresh data now rather than waiting
       // for the next interval tick.
       if (!collapsed) refreshAll();
     });
     // Reflect initial state in the button glyph.
-    document.getElementById('tsi-collapse').textContent = isNarrow ? '+' : '_';
+    document.getElementById('tsi-collapse').textContent = isNarrow ? '▲' : '▼';
 
     // Gear toggles the settings section. Stop the click bubbling to the header
     // so it doesn't also collapse the whole panel.
@@ -1076,6 +1209,24 @@
       const val = document.getElementById('tsi-watch').value;
       watchlist = val.split(',').map((s) => s.trim()).filter(Boolean);
       GM_setValue('watchlist', watchlist);
+
+      // Warn about unknown names so typos don't silently produce empty
+      // watchlists. Only run when item prices are loaded; otherwise skip.
+      const known = Object.values(itemPrices)
+        .map((i) => (i && i.name ? i.name.toLowerCase() : ''))
+        .filter(Boolean);
+      if (known.length > 0) {
+        const unknown = watchlist.filter(
+          (w) => !known.includes(w.toLowerCase())
+        );
+        if (unknown.length > 0) {
+          alert(
+            'Watchlist saved, but these names don\'t match any known Torn item:\n\n' +
+              unknown.join(', ') +
+              '\n\nCheck spelling. Names are case-insensitive but must match exactly otherwise.'
+          );
+        }
+      }
       renderTable();
     });
 
@@ -1127,6 +1278,16 @@
       }
     });
 
+    document.getElementById('tsi-restockratio').addEventListener('input', (e) => {
+      const val = parseFloat(e.target.value);
+      if (!isNaN(val) && val >= RESTOCK_RATIO_MIN && val <= RESTOCK_RATIO_MAX) {
+        restockRatio = val;
+        GM_setValue('restockRatio', restockRatio);
+        // renderTable re-runs predictItem, so the new ratio takes effect now.
+        renderTable();
+      }
+    });
+
     document.getElementById('tsi-country').addEventListener('change', (e) => {
       countryFilter = e.target.value;
       GM_setValue('countryFilter', countryFilter);
@@ -1134,6 +1295,20 @@
     });
 
     document.getElementById('tsi-refresh').addEventListener('click', refreshAll);
+
+    document.getElementById('tsi-reset-data').addEventListener('click', () => {
+      if (!confirm(
+        'Clear all stock history and cached live prices? Predictions will need '
+          + 'a few hours of fresh data to rebuild. This won\'t affect your '
+          + 'settings or API key.'
+      )) return;
+      GM_setValue(HISTORY_KEY, '{}');
+      historyCache = {};
+      for (const k of Object.keys(livePriceCache)) delete livePriceCache[k];
+      expandedCharts.clear();
+      saveExpandedCharts();
+      renderTable();
+    });
 
     // Toggle a per-item history chart by clicking its row. Also handles the
     // "Fetch live price" button inside the chart row. Delegation on the tbody
@@ -1160,14 +1335,31 @@
       const key = row.dataset.key;
       if (expandedCharts.has(key)) expandedCharts.delete(key);
       else expandedCharts.add(key);
+      saveExpandedCharts();
       renderTable();
     });
+
+    // After all elements are in the DOM, cache the ones renderTable hits often.
+    cacheDOM();
   }
 
   function formatMoney(n) {
     if (n === null || n === undefined) return '—';
     const sign = n < 0 ? '-' : '';
     return sign + '$' + Math.abs(Math.round(n)).toLocaleString();
+  }
+
+  // Escape user-supplied or external strings before inserting into HTML.
+  // YATA item names and verdict reasons go through here so a stray < or &
+  // can't break markup or inject attributes.
+  function escapeHTML(s) {
+    if (s === null || s === undefined) return '';
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
   // Round-trip minutes -> "1h23m" / "45m".
@@ -1187,12 +1379,30 @@
 
   function verdictCell(v) {
     const cls = 'tsi-v-' + v.code;
-    return `<span class="tsi-verdict ${cls}" title="${v.reason.replace(/"/g, '')}">${v.label}</span>`;
+    return `<span class="tsi-verdict ${cls}" title="${escapeHTML(v.reason)}">${escapeHTML(v.label)}</span>`;
   }
 
   function restockCell(r, now) {
     const p = r.pred;
-    if (p.state === 'empty' && p.nextRestockMs) return fmtCountdown(p.nextRestockMs, now);
+    if (p.state === 'empty' && p.nextRestockMs) {
+      const conf = p.confidence || 'low';
+      // High: trust the snapped tick. Medium/low: show that it may be later
+      // and add a tag so the user reads it as a hint, not a guarantee.
+      if (conf === 'high') {
+        return fmtCountdown(p.nextRestockMs, now);
+      }
+      // For medium/low confidence, expose the window: from the snapped tick
+      // to a second tick later (~15 extra min of uncertainty per drop in
+      // confidence). Display the range as a countdown range.
+      const padTicks = conf === 'medium' ? 1 : 2;
+      const latestMs = p.nextRestockMs + padTicks * RESTOCK_TICK_MIN * 60000;
+      const earliest = fmtCountdown(p.nextRestockMs, now);
+      const latest = fmtCountdown(latestMs, now);
+      const tag = conf === 'medium'
+        ? '<span style="color:#c8a050;font-size:9px">med</span>'
+        : '<span style="color:#e08060;font-size:9px">low</span>';
+      return `${earliest}–${latest} ${tag}`;
+    }
     if (p.state === 'depleting' && p.etaEmptyMin != null) {
       return 'empties ' + fmtCountdown(now + p.etaEmptyMin * 60000, now);
     }
@@ -1245,6 +1455,19 @@
     const nowLine = `<line x1="${nowX}" y1="${padT}" x2="${nowX}" y2="${padT + plotH}" stroke="#555" stroke-width="1" stroke-dasharray="2,2"/>
                      <text x="${nowX}" y="${H - 6}" fill="#888" font-size="9" text-anchor="middle">now</text>`;
 
+    // X-axis time labels at sensible intervals. We show labels at "start"
+    // (oldest data shown), "now", and one tick in between if it fits.
+    const startX = padL;
+    const startLabel = `<text x="${startX}" y="${H - 6}" fill="#888" font-size="9" text-anchor="start">${fmtChartTime(t0, now)}</text>`;
+    // Middle label if there's room and the span is wide enough.
+    let midLabel = '';
+    const spanHours = tSpan / (60 * 60 * 1000);
+    if (spanHours >= 2 && nowX - startX > 100) {
+      const tMid = t0 + tSpan / 2;
+      const midX = x(tMid).toFixed(1);
+      midLabel = `<text x="${midX}" y="${H - 6}" fill="#888" font-size="9" text-anchor="middle">${fmtChartTime(tMid, now)}</text>`;
+    }
+
     let restockMark = '';
     if (pred && pred.state === 'empty' && pred.nextRestockMs) {
       const rx = x(pred.nextRestockMs);
@@ -1259,6 +1482,8 @@
       <svg width="${W}" height="${H}" style="max-width:100%;display:block">
         ${grid}
         ${nowLine}
+        ${startLabel}
+        ${midLabel}
         ${restockMark}
         <polyline points="${pts}" fill="none" stroke="#5aa0f0" stroke-width="1.5"/>
       </svg>
@@ -1266,19 +1491,46 @@
   }
 
   // Track which item rows have their chart expanded, so the chart survives the
-  // periodic re-render. Keyed by countryCode:itemId.
-  const expandedCharts = new Set();
+  // periodic re-render. Keyed by countryCode:itemId. Persisted to storage so
+  // expansions survive page reloads and PDA navigation.
+  const expandedCharts = new Set(GM_getValue('expandedCharts', []));
+
+  function saveExpandedCharts() {
+    GM_setValue('expandedCharts', Array.from(expandedCharts));
+  }
+
+  // DOM element handles cached after buildPanel so renderTable doesn't run
+  // getElementById for the same ids on every refresh.
+  const dom = {};
+
+  function cacheDOM() {
+    dom.tbody = document.getElementById('tsi-tbody');
+    dom.profitHead = document.getElementById('tsi-profit-head');
+    dom.bestpick = document.getElementById('tsi-bestpick');
+    dom.effcap = document.getElementById('tsi-effcap');
+    dom.money = document.getElementById('tsi-money');
+    dom.location = document.getElementById('tsi-location');
+    dom.status = document.getElementById('tsi-status');
+  }
 
   function renderTable(hist, now) {
     hist = hist || loadHistory();
     now = now || Date.now();
     const rows = rankItineraries(hist, now);
-    const tbody = document.getElementById('tsi-tbody');
+
+    // Use cached DOM refs. If a ref is missing (panel rebuilt mid-session),
+    // re-cache and try again. This avoids dozens of getElementById per render.
+    let tbody = dom.tbody;
+    if (!tbody || !tbody.isConnected) {
+      cacheDOM();
+      tbody = dom.tbody;
+    }
     if (!tbody) return;
 
     // Swap the profit column header to match the chosen display mode.
-    const profitHead = document.getElementById('tsi-profit-head');
-    if (profitHead) profitHead.textContent = profitMode === 'trip' ? '$/trip' : '$/hr';
+    if (dom.profitHead) {
+      dom.profitHead.textContent = profitMode === 'trip' ? '$/trip' : '$/hr';
+    }
 
     tbody.innerHTML = rows
       .slice(0, 50)
@@ -1291,10 +1543,10 @@
         const mainRow = `
           <tr class="tsi-item-row ${r.isWatched ? 'tsi-watched' : ''}" data-key="${key}" data-itemid="${r.itemId}">
             <td>${verdictCell(r.verdict)}</td>
-            <td><span class="tsi-ccode">${r.countryCode.toUpperCase()}</span> ${r.item}${r.isWatched ? ' ★' : ''}</td>
+            <td><span class="tsi-ccode">${r.countryCode.toUpperCase()}</span> ${escapeHTML(r.item)}${r.isWatched ? ' ★' : ''}</td>
             <td>${r.quantity}${r.cashLimited ? ` <span style="color:#f0d27a" title="Cash only covers ${r.itemsAvailable}">(buy ${r.itemsAvailable})</span>` : ''}</td>
             <td class="${profitClass}">${formatMoney(profitVal)}</td>
-            <td class="tsi-col-extra">${r.country}</td>
+            <td class="tsi-col-extra">${escapeHTML(r.country)}</td>
             <td class="tsi-col-extra">${restockCell(r, now)}</td>
             <td class="tsi-col-extra">${formatTime(r.roundTripMin)}</td>
           </tr>
@@ -1309,7 +1561,7 @@
           <tr class="tsi-chart-row" data-key="${key}">
             <td colspan="7" style="padding:6px 8px;background:#141414">
               <div style="font-size:11px;color:#aaa;margin-bottom:2px">
-                ${r.item} (${r.country}) stock history
+                ${escapeHTML(r.item)} (${escapeHTML(r.country)}) stock history
               </div>
               <div style="font-size:11px;margin-bottom:4px;display:flex;align-items:center;gap:8px">
                 ${priceNote}
@@ -1330,65 +1582,69 @@
 
     // Best pick: highest profit/hr among 'go' verdicts (watched gets priority).
     const goRows = rows.filter((r) => r.verdict.code === 'go' && r.profitPerHour !== null);
-    const best = document.getElementById('tsi-bestpick');
-    if (best) {
+    if (dom.bestpick) {
       if (goRows.length) {
         const watchedGo = goRows.filter((r) => r.isWatched);
         const pick = (watchedGo.length ? watchedGo : goRows)[0];
-        best.style.display = 'block';
+        dom.bestpick.style.display = 'block';
         const pickVal = profitMode === 'trip' ? pick.profitPerTrip : pick.profitPerHour;
         const pickUnit = profitMode === 'trip' ? '/trip' : '/hr';
-        best.innerHTML = `<strong>Fly now:</strong> ${pick.item} in ${pick.country}. ${pick.verdict.reason}, ${formatMoney(pickVal)}${pickUnit}`;
+        dom.bestpick.innerHTML = `<strong>Fly now:</strong> ${escapeHTML(pick.item)} in ${escapeHTML(pick.country)}. ${escapeHTML(pick.verdict.reason)}, ${formatMoney(pickVal)}${pickUnit}`;
       } else {
-        best.style.display = 'none';
+        dom.bestpick.style.display = 'none';
       }
     }
 
-    const effcap = document.getElementById('tsi-effcap');
-    if (effcap) {
-      effcap.textContent = `(carrying ${effectiveCapacity()} with ${
+    if (dom.effcap) {
+      dom.effcap.textContent = `(carrying ${effectiveCapacity()} with ${
         TRAVEL_METHODS[travelMethod].name
       })`;
     }
 
-    const moneyEl = document.getElementById('tsi-money');
-    if (moneyEl) {
+    if (dom.money) {
       if (userMoney !== null) {
-        moneyEl.textContent = 'Cash: ' + formatMoney(userMoney);
-        moneyEl.style.color = '#9fe8b0';
+        dom.money.textContent = 'Cash: ' + formatMoney(userMoney);
+        dom.money.style.color = '#9fe8b0';
       } else if (TORN_API_KEY && affordFilter) {
-        moneyEl.textContent = 'Cash unavailable (key needs money access)';
-        moneyEl.style.color = '#e0a060';
+        dom.money.textContent = 'Cash unavailable (key needs money access)';
+        dom.money.style.color = '#e0a060';
       } else {
-        moneyEl.textContent = '';
+        dom.money.textContent = '';
       }
     }
 
-    const locEl = document.getElementById('tsi-location');
-    if (locEl) {
+    if (dom.location) {
       const d = Math.round(travelState.delayToTakeoffMin || 0);
       if (travelState.location === 'torn') {
-        locEl.textContent = 'In Torn, ready to fly';
+        dom.location.textContent = 'In Torn, ready to fly';
       } else if (travelState.location === 'abroad') {
-        locEl.textContent = `${travelState.description || 'Abroad'}. Takeoff in ~${formatTime(d)} (after flying home)`;
+        dom.location.textContent = `${travelState.description || 'Abroad'}. Takeoff in ~${formatTime(d)} (after flying home)`;
       } else if (travelState.location === 'outbound') {
-        locEl.textContent = `${travelState.description || 'Traveling'}. Takeoff in ~${formatTime(d)}`;
+        dom.location.textContent = `${travelState.description || 'Traveling'}. Takeoff in ~${formatTime(d)}`;
       } else if (travelState.location === 'returning') {
-        locEl.textContent = `Heading to Torn. Takeoff in ~${formatTime(d)}`;
+        dom.location.textContent = `Heading to Torn. Takeoff in ~${formatTime(d)}`;
       } else {
-        locEl.textContent = '';
+        dom.location.textContent = '';
       }
     }
 
     // Learning progress: how many tracked items have enough history to advise.
     const tracked = Object.values(hist).filter((s) => s.length >= MIN_POINTS_FOR_FIT).length;
     const total = Object.keys(hist).length;
-    const status = document.getElementById('tsi-status');
-    if (status) {
+    if (dom.status) {
       const stamp = new Date().toLocaleTimeString();
       let msg = `Updated ${stamp}. Tracking ${tracked}/${total} items with enough history`;
+      // YATA's export is crowd-sourced and can lag the actual game state. Show
+      // how stale the data is when we know, so users don't trust a 5-min-old
+      // reading as live.
+      if (yataExportMs !== null) {
+        const ageMin = Math.round((Date.now() - yataExportMs) / 60000);
+        if (ageMin >= 2) {
+          msg += `. YATA data ${ageMin}m old`;
+        }
+      }
       if (!TORN_API_KEY) msg += '. Add a Torn API key for profit figures';
-      status.textContent = msg;
+      dom.status.textContent = msg;
     }
   }
 
@@ -1397,21 +1653,51 @@
   // ---------------------------------------------------------------------
 
   async function refreshAll() {
-    // Skip network work when there's nothing to show: panel gone (navigated
-    // away within the SPA) or collapsed. Saves Torn API calls against your
-    // 100/min budget while you're not looking at it.
     const panel = document.getElementById('tsi-panel');
-    if (!panel || panel.classList.contains('tsi-collapsed')) return;
+    // No panel at all means we navigated away within the SPA; nothing to do.
+    if (!panel) return;
 
-    const status = document.getElementById('tsi-status');
-    try {
-      await Promise.all([fetchStockData(), fetchItemPrices(), fetchUserState()]);
-      const now = Date.now();
-      const hist = recordSnapshot(now);
-      renderTable(hist, now);
-    } catch (err) {
-      console.error('Torn Stock Itinerary refresh failed:', err);
-      if (status) status.textContent = 'Error: ' + err.message;
+    // Each fetch is independent: YATA stock, Torn item prices, user state.
+    // Use allSettled so a single failure (typically YATA going 502 for a few
+    // minutes) doesn't blank the whole panel. We render with whatever did
+    // come back, falling back to previously cached stockData.
+    const results = await Promise.allSettled([
+      fetchStockData(),
+      fetchItemPrices(),
+      fetchUserState(),
+    ]);
+
+    const failed = [];
+    const labels = ['YATA stock', 'Torn item prices', 'user state'];
+    results.forEach((r, i) => {
+      if (r.status === 'rejected') {
+        failed.push(labels[i]);
+        console.warn(labels[i] + ' fetch failed:', r.reason);
+      }
+    });
+
+    const now = Date.now();
+    // Always record a snapshot so collapsed-panel users still build history.
+    // Previously, collapsing the panel halted data collection.
+    const hist = recordSnapshot(now);
+
+    // Skip the heavy render work when the panel is collapsed.
+    if (panel.classList.contains('tsi-collapsed')) return;
+
+    renderTable(hist, now);
+
+    if (dom.status) {
+      if (failed.length === 0) {
+        // Successful refresh: leave renderTable's "Updated X. Tracking N/M"
+        // message in place, since it carries more info than just a timestamp.
+      } else if (failed.includes('YATA stock')) {
+        // YATA is a third-party service; flag clearly so it doesn't look like
+        // a script bug. Other services have their own messages.
+        dom.status.textContent =
+          'YATA temporarily unreachable. Showing last known stock. Retrying next refresh.';
+      } else {
+        dom.status.textContent = 'Partial update: ' + failed.join(', ') + ' failed';
+      }
     }
   }
 
@@ -1437,7 +1723,8 @@
 
     // Re-inject if Torn's SPA re-renders and wipes the panel, and tear it
     // down when you leave the travel page. A single observer on body covers
-    // both browser and PDA without polling.
+    // both browser and PDA without polling. Debounced so it doesn't fire
+    // on every micro-mutation while Torn's UI is animating.
     const startObserver = () => {
       const target = document.body || document.documentElement;
       if (!target) {
@@ -1445,13 +1732,19 @@
         setTimeout(startObserver, 200);
         return;
       }
-      const observer = new MutationObserver(() => {
+      let pending = null;
+      const handle = () => {
+        pending = null;
         if (onTravelPage()) {
           ensurePanel();
         } else {
           const stale = document.getElementById('tsi-panel');
           if (stale) stale.remove();
         }
+      };
+      const observer = new MutationObserver(() => {
+        if (pending !== null) return;
+        pending = setTimeout(handle, OBSERVER_DEBOUNCE_MS);
       });
       observer.observe(target, { childList: true, subtree: true });
     };
