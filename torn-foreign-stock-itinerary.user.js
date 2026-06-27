@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.6.1
+// @version      2.7.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -483,6 +483,236 @@
 
   // Append the current snapshot. Records zero-stock readings too, since the
   // moment stock hits zero is what anchors a restock prediction.
+  // ---------------------------------------------------------------------
+  // Cycle history: per-item record of completed empty->restock cycles.
+  // Used by the per-item prediction model to learn item-specific timing.
+  // ---------------------------------------------------------------------
+
+  // Key: "ccode:itemid". Value: array of cycle objects:
+  //   { emptiedMs, restockedMs, peak, selloutDurationMin, predicted }
+  //   predicted = { rawMs, source: 'ratio'|'fixed'|'global' } or null.
+  // Capped at MAX_CYCLES_PER_ITEM per item to bound storage.
+  const CYCLE_HISTORY_KEY = 'cycleHistory';
+  const MAX_CYCLES_PER_ITEM = 30;
+  let cycleHistoryCache = null;
+
+  function loadCycleHistory() {
+    if (cycleHistoryCache !== null) return cycleHistoryCache;
+    try {
+      cycleHistoryCache = JSON.parse(GM_getValue(CYCLE_HISTORY_KEY, '{}'));
+    } catch {
+      cycleHistoryCache = {};
+    }
+    return cycleHistoryCache;
+  }
+
+  function saveCycleHistory(ch) {
+    cycleHistoryCache = ch;
+    try {
+      GM_setValue(CYCLE_HISTORY_KEY, JSON.stringify(ch));
+    } catch (err) {
+      console.warn('Cycle history save failed:', err);
+    }
+  }
+
+  // Detect emptied->restocked transitions in a single item's series and
+  // append any newly completed cycles to cycleHistory. Called from
+  // recordSnapshot. We use the existing time series rather than tracking
+  // transitions live, so this works even when cycle history starts empty.
+  function detectAndRecordCycle(key, series, now) {
+    if (!series || series.length < 3) return;
+    const ch = loadCycleHistory();
+    if (!ch[key]) ch[key] = [];
+    const existing = ch[key];
+    const lastRecorded = existing.length > 0 ? existing[existing.length - 1].restockedMs : 0;
+
+    // Walk the series looking for a transition from 0 -> >0 (a restock).
+    // Then look backwards from there to find when stock first hit 0 (emptied),
+    // and before that the peak that preceded the empty period.
+    for (let i = 1; i < series.length; i++) {
+      const prevQty = series[i - 1][1];
+      const curQty = series[i][1];
+      if (prevQty > 0 || curQty <= 0) continue; // not a restock transition
+
+      const restockedMs = series[i][0];
+      if (restockedMs <= lastRecorded) continue; // already recorded
+
+      // Walk back to find the empty start.
+      let emptiedMs = null;
+      let peakIdx = -1;
+      let peakVal = 0;
+      for (let j = i - 1; j >= 0; j--) {
+        if (series[j][1] === 0 && emptiedMs === null) {
+          // Still in empty period. Continue.
+        } else if (series[j][1] > 0 && emptiedMs === null) {
+          // Just stepped out of empty period going backwards. The next reading
+          // (at j+1) was the first zero, so that's when it emptied.
+          emptiedMs = series[j + 1][0];
+        }
+        if (emptiedMs !== null) {
+          // We're now in the pre-empty (decline run) phase. Track the peak.
+          if (series[j][1] > peakVal) {
+            peakVal = series[j][1];
+            peakIdx = j;
+          } else if (j > 0 && series[j][1] < series[j - 1][1]) {
+            // Past the peak, hit another decline going backwards: cycle boundary.
+            break;
+          }
+        }
+      }
+      if (emptiedMs === null || peakIdx < 0) continue;
+
+      const selloutDurationMin = (emptiedMs - series[peakIdx][0]) / 60000;
+      if (selloutDurationMin <= 0) continue;
+
+      existing.push({
+        emptiedMs,
+        restockedMs,
+        peak: peakVal,
+        selloutDurationMin,
+        predicted: null, // populated below if a prediction was pending
+      });
+
+      // If there was a pending prediction for this empty period (recorded when
+      // the script first saw stock at zero), bind it into this completed
+      // cycle so accuracy can be measured.
+      const pending = ch[key + ':pending'];
+      if (pending && pending.emptiedAt && Math.abs(pending.emptiedAt - emptiedMs) < 60000) {
+        existing[existing.length - 1].predicted = {
+          rawMs: pending.predictedRawMs,
+          tickMs: pending.predictedTickMs,
+          source: pending.source,
+        };
+        delete ch[key + ':pending'];
+      }
+    }
+
+    // Trim oldest cycles beyond cap.
+    if (existing.length > MAX_CYCLES_PER_ITEM) {
+      existing.splice(0, existing.length - MAX_CYCLES_PER_ITEM);
+    }
+    saveCycleHistory(ch);
+  }
+
+  // ---------------------------------------------------------------------
+  // Stats helpers used by the per-item model.
+  // ---------------------------------------------------------------------
+
+  function median(arr) {
+    if (!arr || arr.length === 0) return null;
+    const s = arr.slice().sort((a, b) => a - b);
+    const mid = Math.floor(s.length / 2);
+    return s.length % 2 === 0 ? (s[mid - 1] + s[mid]) / 2 : s[mid];
+  }
+
+  // Median absolute deviation: robust spread measure. Lower MAD = tighter
+  // observations = more confidence in the median as the true value.
+  function mad(arr) {
+    const m = median(arr);
+    if (m === null) return null;
+    const deviations = arr.map((x) => Math.abs(x - m));
+    return median(deviations);
+  }
+
+  // Stash a prediction against the active empty period for this item, so
+  // when the actual restock fires we can score predicted-vs-actual.
+  //
+  // The empty period is identified by emptiedAt (the timestamp when stock
+  // first hit zero). We only attach the FIRST prediction made during an
+  // empty period - re-predicting on every refresh would inflate accuracy by
+  // letting late predictions take credit for being closer to the truth.
+  function recordPredictionForActiveEmpty(itemKey, emptiedAt, pred) {
+    const ch = loadCycleHistory();
+    if (!ch[itemKey]) ch[itemKey] = [];
+    if (!ch[itemKey + ':pending']) ch[itemKey + ':pending'] = {};
+    const pending = ch[itemKey + ':pending'];
+    // Only store the first prediction for this emptiedAt.
+    if (pending.emptiedAt !== emptiedAt) {
+      pending.emptiedAt = emptiedAt;
+      pending.predictedRawMs = pred.rawRestockMs;
+      pending.predictedTickMs = pred.nextRestockMs;
+      pending.source = pred.model ? pred.model.source : 'global';
+      saveCycleHistory(ch);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Per-item prediction model.
+  // ---------------------------------------------------------------------
+
+  // Derive an item-specific model from its cycle history. Picks between two
+  // hypotheses: (a) restock wait is proportional to sellout duration (ratio
+  // model), or (b) restock wait is a fixed duration regardless. Chooses the
+  // one with lower spread across observed cycles - that's the model the data
+  // actually supports for this item.
+  //
+  // Returns:
+  //   { source, ratio, fixedWaitMin, samples, accuracyMin, drift }
+  //   source: 'global' | 'ratio' | 'fixed'
+  //   accuracyMin: mean absolute error in predicted-vs-actual restock time
+  //   drift: signed mean error (positive = predictions running late)
+  function itemModel(key) {
+    const ch = loadCycleHistory();
+    const cycles = ch[key];
+    if (!cycles || cycles.length === 0) {
+      return { source: 'global', ratio: restockRatio, fixedWaitMin: null,
+               samples: 0, accuracyMin: null, drift: null };
+    }
+
+    // Use the most recent N cycles (more weight on recent behaviour).
+    const recent = cycles.slice(-15);
+
+    // Observed wait per cycle.
+    const waits = recent.map((c) => (c.restockedMs - c.emptiedMs) / 60000);
+    const ratios = recent.map((c, i) => waits[i] / c.selloutDurationMin);
+
+    // Fixed-wait model: median wait, MAD as spread.
+    const fixedWait = median(waits);
+    const fixedSpread = mad(waits);
+
+    // Ratio model: median ratio, but spread measured in MINUTES against
+    // this item's typical sellout duration so we compare apples to apples.
+    const typicalSellout = median(recent.map((c) => c.selloutDurationMin));
+    const ratioMedian = median(ratios);
+    const ratioSpread = mad(ratios) * typicalSellout;
+
+    // Need at least 3 cycles before trusting a per-item model. Below that,
+    // global ratio is more reliable than an undertrained per-item estimate.
+    let source = 'global';
+    let chosenRatio = restockRatio;
+    let chosenFixed = null;
+    if (recent.length >= 3) {
+      if (fixedSpread !== null && ratioSpread !== null && fixedSpread <= ratioSpread) {
+        source = 'fixed';
+        chosenFixed = fixedWait;
+      } else if (ratioMedian !== null) {
+        source = 'ratio';
+        chosenRatio = ratioMedian;
+      }
+    }
+
+    // Accuracy: compare each cycle's predicted-vs-actual restock time.
+    // Cycles with no prediction logged contribute nothing.
+    const errors = recent
+      .filter((c) => c.predicted && typeof c.predicted.rawMs === 'number')
+      .map((c) => (c.predicted.rawMs - c.restockedMs) / 60000);
+    const accuracyMin = errors.length > 0
+      ? errors.reduce((a, b) => a + Math.abs(b), 0) / errors.length
+      : null;
+    const drift = errors.length > 0
+      ? errors.reduce((a, b) => a + b, 0) / errors.length
+      : null;
+
+    return {
+      source,
+      ratio: chosenRatio,
+      fixedWaitMin: chosenFixed,
+      samples: recent.length,
+      accuracyMin,
+      drift,
+    };
+  }
+
   function recordSnapshot(now) {
     const hist = loadHistory();
     const cutoff = now - HISTORY_WINDOW_MS;
@@ -506,6 +736,10 @@
 
         // Trim to window.
         while (series.length && series[0][0] < cutoff) series.shift();
+
+        // Detect any completed empty->restock cycle and record it. Cheap
+        // because it only walks the series once per snapshot.
+        detectAndRecordCycle(key, series, now);
       }
     }
 
@@ -628,9 +862,11 @@
   }
 
   // Produce a prediction object for one item's series given current qty.
-  //   { state, qty, sellRate, etaEmptyMin, nextRestockMs, confidence }
+  //   { state, qty, sellRate, etaEmptyMin, nextRestockMs, confidence, model }
   // state: 'learning' | 'in-stock' | 'depleting' | 'empty'
-  function predictItem(series, now) {
+  // itemKey: "ccode:itemid" lets us pull per-item learned model. Optional;
+  //   when omitted, uses global ratio (e.g. for unit tests).
+  function predictItem(series, now, itemKey) {
     const result = {
       state: 'learning',
       sellRate: null,
@@ -638,11 +874,11 @@
       nextRestockMs: null,
       rawRestockMs: null,
       restockPeak: null,
-      // Derived from the last completed sellout cycle: peak/duration. Used as
-      // a fallback when current sellRate can't be measured (low-volume item
-      // with no detectable decline in current snapshots).
       historicalRatePerMin: null,
       confidence: 'low',
+      // The model used for the empty-state restock prediction. Exposed so
+      // the UI can show how the prediction was made.
+      model: null,
     };
     if (!series || series.length < MIN_POINTS_FOR_FIT) return result;
 
@@ -650,37 +886,73 @@
     const rate = sellRatePerMin(series);
     result.sellRate = rate;
 
-    // Use the most recent observed sellout cycle to seed both the restock
-    // peak (how much a fresh refill puts on the shelf) and the wait time.
-    // Falls back to current quantity if no full cycle is logged yet.
     const recent = lastSellout(series);
     result.restockPeak = recent ? recent.peak : Math.max(qty, 0);
     if (recent && recent.durationMin > 0) {
       result.historicalRatePerMin = recent.peak / recent.durationMin;
     }
 
+    // Per-item model: chosen between ratio and fixed-wait based on which has
+    // tighter agreement across observed cycles. Falls back to the global
+    // ratio when fewer than 3 cycles have been seen.
+    const model = itemKey ? itemModel(itemKey) : null;
+    result.model = model;
+
     if (qty <= 0) {
       result.state = 'empty';
-      // Restock = (last sellout duration × restockRatio), snapped to a tick.
-      // We keep both the raw prediction and the snapped value: the snapped
-      // time is what the script acts on (restocks really do fire on ticks),
-      // the raw time drives confidence and range display.
       const emptiedAt = series[series.length - 1][0];
-      if (recent) {
-        const waitMin = recent.durationMin * restockRatio;
+      if (model && model.source === 'fixed' && model.fixedWaitMin !== null) {
+        // Item-specific fixed-wait model: this item's restocks are roughly
+        // a constant duration regardless of sellout speed.
+        const waitMin = model.fixedWaitMin;
         result.rawRestockMs = emptiedAt + waitMin * 60000;
         result.nextRestockMs = nextTick(result.rawRestockMs);
-        // Confidence rises with how many sell-out cycles have been observed,
-        // since restockRatio is a population guess that varies per item.
-        result.confidence = series.length >= CONF_HIGH_POINTS ? 'high'
-          : series.length >= CONF_MEDIUM_POINTS ? 'medium'
-          : 'low';
+      } else if (recent) {
+        // Ratio model: wait proportional to sellout duration. Uses per-item
+        // ratio when available, falls back to global.
+        const ratio = model && model.source === 'ratio' ? model.ratio : restockRatio;
+        const waitMin = recent.durationMin * ratio;
+        result.rawRestockMs = emptiedAt + waitMin * 60000;
+        result.nextRestockMs = nextTick(result.rawRestockMs);
       } else {
         // No measured cycle: fall back to the next tick as a floor.
         result.rawRestockMs = now;
         result.nextRestockMs = nextTick(now);
-        result.confidence = 'low';
       }
+
+      // Apply drift correction: if recent predictions for this item have been
+      // systematically late or early, shift the prediction by the drift amount.
+      // Capped at ±15min so a wild drift doesn't override the underlying model.
+      if (model && model.drift !== null && Math.abs(model.drift) > 1) {
+        const driftMs = -Math.max(-15, Math.min(15, model.drift)) * 60000;
+        result.rawRestockMs += driftMs;
+        result.nextRestockMs = nextTick(result.rawRestockMs);
+      }
+
+      // Confidence: blended signal from cycle count and series length.
+      const cycleCount = model ? model.samples : 0;
+      let confTier = cycleCount >= 5 && series.length >= CONF_HIGH_POINTS ? 'high'
+        : cycleCount >= 2 || series.length >= CONF_MEDIUM_POINTS ? 'medium'
+        : 'low';
+
+      // Downgrade confidence if YATA data is stale. Crowd-sourced data 5+
+      // min old means we're predicting on yesterday's news.
+      if (yataExportMs !== null) {
+        const ageMin = (Date.now() - yataExportMs) / 60000;
+        if (ageMin >= 5) {
+          confTier = 'low';
+        } else if (ageMin >= 2 && confTier === 'high') {
+          confTier = 'medium';
+        }
+      }
+      result.confidence = confTier;
+
+      // Record this prediction against the active empty period so we can
+      // score it against the actual restock time later. Only the first
+      // prediction per empty period counts (we don't want to "re-predict"
+      // every refresh and overwrite the original commitment).
+      if (itemKey) recordPredictionForActiveEmpty(itemKey, emptiedAt, result);
+
       return result;
     }
 
@@ -722,8 +994,9 @@
       const takeoffDelay = travelState.delayToTakeoffMin || 0;
 
       for (const stockItem of entry.stocks) {
-        const series = hist[code + ':' + stockItem.id];
-        const pred = predictItem(series, now);
+        const itemKey = code + ':' + stockItem.id;
+        const series = hist[itemKey];
+        const pred = predictItem(series, now, itemKey);
 
         // Verdict accounts for the time to get home and launch before flying.
         const verdict = adviseFlight(stockItem, pred, oneWayMin, now, takeoffDelay);
@@ -1528,6 +1801,8 @@
       )) return;
       GM_setValue(HISTORY_KEY, '{}');
       historyCache = {};
+      GM_setValue(CYCLE_HISTORY_KEY, '{}');
+      cycleHistoryCache = {};
       for (const k of Object.keys(livePriceCache)) delete livePriceCache[k];
       expandedCharts.clear();
       saveExpandedCharts();
@@ -1849,13 +2124,37 @@
         const priceNote = cachedPrice
           ? `<span style="color:#9fe8b0">Market avg: ${formatMoney(cachedPrice)}</span>`
           : `<span style="color:#888">Market value used (${sellDiscount}% discount applied)</span>`;
+
+        // Per-item model summary: which prediction model is in use and how
+        // accurate it's been on recent cycles. Honest reporting.
+        const m = r.pred.model;
+        let modelNote = '';
+        if (m) {
+          if (m.source === 'global') {
+            modelNote = `<span style="color:#888">Model: global ratio (${m.ratio.toFixed(2)}). Needs 3+ cycles to learn this item.</span>`;
+          } else if (m.source === 'ratio') {
+            const accBit = m.accuracyMin !== null
+              ? ` Accuracy: ±${m.accuracyMin.toFixed(1)}min over ${m.samples} cycles.`
+              : '';
+            const driftBit = m.drift !== null && Math.abs(m.drift) > 2
+              ? ` Drift: ${m.drift > 0 ? '+' : ''}${m.drift.toFixed(1)}min (${m.drift > 0 ? 'predictions running late' : 'predictions running early'}).`
+              : '';
+            modelNote = `<span style="color:#9fe8b0">Model: per-item ratio ${m.ratio.toFixed(2)}.${accBit}${driftBit}</span>`;
+          } else if (m.source === 'fixed') {
+            const accBit = m.accuracyMin !== null
+              ? ` Accuracy: ±${m.accuracyMin.toFixed(1)}min over ${m.samples} cycles.`
+              : '';
+            modelNote = `<span style="color:#9fe8b0">Model: fixed wait ${m.fixedWaitMin.toFixed(1)}min.${accBit}</span>`;
+          }
+        }
+
         const chartRow = `
           <tr class="tsi-chart-row" data-key="${key}">
             <td colspan="7" style="padding:6px 8px;background:#141414">
               <div style="font-size:11px;color:#aaa;margin-bottom:2px">
                 ${escapeHTML(r.item)} (${escapeHTML(r.country)}) stock history
               </div>
-              <div style="font-size:11px;margin-bottom:4px;display:flex;align-items:center;gap:8px">
+              <div style="font-size:11px;margin-bottom:4px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                 ${priceNote}
                 ${TORN_API_KEY
                   ? `<button class="tsi-live-price-btn" data-itemid="${r.itemId}"
@@ -1864,6 +2163,7 @@
                      </button>`
                   : ''}
               </div>
+              ${modelNote ? `<div style="font-size:10px;margin-bottom:4px">${modelNote}</div>` : ''}
               ${chart}
             </td>
           </tr>
