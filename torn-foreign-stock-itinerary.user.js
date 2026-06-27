@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.5.0
+// @version      2.6.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -1061,11 +1061,21 @@
       padding: 8px 10px;
       background: #2a2a2a;
       border-bottom: 1px solid #444;
-      cursor: pointer;
+      /* Indicates draggable on desktop. On PDA the cursor is irrelevant but
+         touch-action prevents the browser from scroll-stealing the gesture. */
+      cursor: move;
+      touch-action: none;
       display: flex;
       justify-content: space-between;
       align-items: center;
       user-select: none;
+    }
+    /* While dragging, drop the box shadow into something punchier so the
+       user gets clear feedback that the panel is following their pointer. */
+    #tsi-panel.tsi-dragging {
+      box-shadow: 0 4px 20px rgba(90,160,240,0.4);
+      opacity: 0.95;
+      transition: none;
     }
     #tsi-panel .tsi-body { padding: 8px 10px; }
     #tsi-panel table { width: 100%; border-collapse: collapse; }
@@ -1281,6 +1291,13 @@
               or after a big Torn update changes the underlying mechanics.
             </span>
           </div>
+          <div>
+            <button id="tsi-reset-position">Reset panel position</button>
+            <span style="color:#888;font-size:10px">
+              Returns the panel to its default location. Use if you dragged it
+              somewhere awkward or it appears off-screen after a screen rotate.
+            </span>
+          </div>
         </div>
 
         <table id="tsi-table">
@@ -1309,14 +1326,72 @@
       document.getElementById('tsi-settings').classList.remove('tsi-settings-hidden');
     }
 
-    panel.querySelector('h3').addEventListener('click', () => {
-      panel.classList.toggle('tsi-collapsed');
-      const collapsed = panel.classList.contains('tsi-collapsed');
-      document.getElementById('tsi-collapse').textContent = collapsed ? '▲' : '▼';
-      // Expanding after a collapse: pull fresh data now rather than waiting
-      // for the next interval tick.
-      if (!collapsed) refreshAll();
+    // Apply any saved custom position before wiring drag handlers.
+    if (panelPosition) applyPanelPosition(panel, panelPosition);
+
+    // Header doubles as click target (collapse toggle) and drag handle.
+    // Distinguish tap from drag by movement distance: under 5px counts as a
+    // click, anything more is a drag. PointerEvents cover mouse and touch
+    // uniformly so this works on both desktop and PDA.
+    const header = panel.querySelector('h3');
+    const DRAG_THRESHOLD_PX = 5;
+    let dragState = null;
+
+    header.addEventListener('pointerdown', (e) => {
+      // Ignore clicks on buttons inside the header (collapse arrow, gear).
+      if (e.target.closest('button')) return;
+      const rect = panel.getBoundingClientRect();
+      dragState = {
+        startX: e.clientX,
+        startY: e.clientY,
+        panelStartLeft: rect.left,
+        panelStartTop: rect.top,
+        moved: false,
+        pointerId: e.pointerId,
+      };
+      // Capture so we keep receiving move/up even if the pointer leaves the
+      // header. Without this, fast drags lose tracking.
+      try { header.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
     });
+
+    header.addEventListener('pointermove', (e) => {
+      if (!dragState || e.pointerId !== dragState.pointerId) return;
+      const dx = e.clientX - dragState.startX;
+      const dy = e.clientY - dragState.startY;
+      if (!dragState.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
+      dragState.moved = true;
+      panel.classList.add('tsi-dragging');
+      // Apply position live so the drag feels real-time.
+      applyPanelPosition(panel, {
+        left: dragState.panelStartLeft + dx,
+        top: dragState.panelStartTop + dy,
+      });
+      // Block touch scrolling under the header while dragging.
+      e.preventDefault();
+    });
+
+    function endDrag(e) {
+      if (!dragState || e.pointerId !== dragState.pointerId) return;
+      const wasDrag = dragState.moved;
+      const finalRect = panel.getBoundingClientRect();
+      try { header.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      dragState = null;
+      panel.classList.remove('tsi-dragging');
+
+      if (wasDrag) {
+        // Save the dropped position.
+        savePanelPosition({ left: finalRect.left, top: finalRect.top });
+      } else {
+        // Tap, not drag: toggle collapse like the old click handler did.
+        panel.classList.toggle('tsi-collapsed');
+        const collapsed = panel.classList.contains('tsi-collapsed');
+        document.getElementById('tsi-collapse').textContent = collapsed ? '▲' : '▼';
+        if (!collapsed) refreshAll();
+      }
+    }
+    header.addEventListener('pointerup', endDrag);
+    header.addEventListener('pointercancel', endDrag);
+
     // Reflect initial collapsed state in the button glyph.
     document.getElementById('tsi-collapse').textContent = '▲';
 
@@ -1452,6 +1527,11 @@
       observedFlightTimes = {};
       GM_setValue('observedFlightTimes', observedFlightTimes);
       renderTable();
+    });
+
+    document.getElementById('tsi-reset-position').addEventListener('click', () => {
+      savePanelPosition(null);
+      applyPanelPosition(panel, null);
     });
 
     // Toggle a per-item history chart by clicking its row. Also handles the
@@ -1646,6 +1726,52 @@
 
   function saveExpandedCharts() {
     GM_setValue('expandedCharts', Array.from(expandedCharts));
+  }
+
+  // Custom panel position from user dragging. Null means use CSS defaults
+  // (bottom-right on desktop, docked bottom on PDA). Stored as {left, top}
+  // pixel offsets from the top-left.
+  let panelPosition = GM_getValue('panelPosition', null);
+
+  function savePanelPosition(pos) {
+    panelPosition = pos;
+    GM_setValue('panelPosition', pos);
+  }
+
+  // Clamp a position so the panel stays visible in the current viewport. We
+  // need to keep at least PANEL_MARGIN_PX of the header on screen so the user
+  // can always grab and move it again, even after orientation changes shrink
+  // the viewport.
+  function clampPanelPosition(pos, panelEl) {
+    const PANEL_MARGIN_PX = 40; // min visible drag target on any edge
+    const rect = panelEl.getBoundingClientRect();
+    const w = rect.width || 320;
+    const h = rect.height || 40;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    return {
+      left: Math.max(PANEL_MARGIN_PX - w, Math.min(pos.left, vw - PANEL_MARGIN_PX)),
+      top: Math.max(0, Math.min(pos.top, vh - PANEL_MARGIN_PX)),
+    };
+  }
+
+  // Apply a saved position to the panel element as inline styles. Inline
+  // beats the bottom/right CSS rules, but we also have to clear those rules
+  // by setting bottom/right to auto inline, otherwise the panel renders at
+  // the intersection of all four constraints (and gets stretched).
+  function applyPanelPosition(panel, pos) {
+    if (!pos) {
+      panel.style.left = '';
+      panel.style.top = '';
+      panel.style.right = '';
+      panel.style.bottom = '';
+      return;
+    }
+    const clamped = clampPanelPosition(pos, panel);
+    panel.style.left = clamped.left + 'px';
+    panel.style.top = clamped.top + 'px';
+    panel.style.right = 'auto';
+    panel.style.bottom = 'auto';
   }
 
   // DOM element handles cached after buildPanel so renderTable doesn't run
@@ -1908,6 +2034,20 @@
       observer.observe(target, { childList: true, subtree: true });
     };
     startObserver();
+
+    // Re-clamp the panel's custom position when the viewport changes size,
+    // typically a phone orientation flip. Without this, a position saved in
+    // landscape can land off-screen in portrait.
+    let resizeTimer = null;
+    const onResize = () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        const panel = document.getElementById('tsi-panel');
+        if (panel && panelPosition) applyPanelPosition(panel, panelPosition);
+      }, 150);
+    };
+    window.addEventListener('resize', onResize);
+    window.addEventListener('orientationchange', onResize);
 
     setInterval(refreshAll, REFRESH_MS);
   }
