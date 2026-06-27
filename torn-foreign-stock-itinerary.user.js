@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.6.0
+// @version      2.6.1
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -1383,17 +1383,33 @@
         savePanelPosition({ left: finalRect.left, top: finalRect.top });
       } else {
         // Tap, not drag: toggle collapse like the old click handler did.
-        panel.classList.toggle('tsi-collapsed');
-        const collapsed = panel.classList.contains('tsi-collapsed');
-        document.getElementById('tsi-collapse').textContent = collapsed ? '▲' : '▼';
-        if (!collapsed) refreshAll();
+        toggleCollapse();
       }
     }
     header.addEventListener('pointerup', endDrag);
     header.addEventListener('pointercancel', endDrag);
 
+    // Toggle helper used by both the header tap and the collapse button click.
+    // Kept as a closure so it can be referenced from inside endDrag too.
+    function toggleCollapse() {
+      panel.classList.toggle('tsi-collapsed');
+      const collapsed = panel.classList.contains('tsi-collapsed');
+      document.getElementById('tsi-collapse').textContent = collapsed ? '▲' : '▼';
+      if (!collapsed) refreshAll();
+    }
+
+    // Collapse button: explicit click handler so it works regardless of
+    // whether the header tap is being interpreted as drag-start. Stop the
+    // pointerdown propagating so the drag detector doesn't try to track it.
+    const collapseBtn = document.getElementById('tsi-collapse');
+    collapseBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
+    collapseBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleCollapse();
+    });
+
     // Reflect initial collapsed state in the button glyph.
-    document.getElementById('tsi-collapse').textContent = '▲';
+    collapseBtn.textContent = '▲';
 
     // Gear toggles the settings section. Stop the click bubbling to the header
     // so it doesn't also collapse the whole panel.
