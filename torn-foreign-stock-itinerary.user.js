@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.4.0
+// @version      2.5.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -595,13 +595,17 @@
     // Walk further back to find the peak that preceded this zero.
     let peakIdx = zeroIdx;
     let peakVal = series[zeroIdx][1];
+    let foundPeak = false;
     for (let i = zeroIdx - 1; i >= 0; i--) {
       if (series[i][1] > peakVal) {
         peakVal = series[i][1];
         peakIdx = i;
-      } else if (i > 0 && series[i][1] < series[i - 1][1]) {
-        // Stock rises going backwards: we've crossed a previous restock.
-        // Stop here so we measure THIS cycle, not the one before it.
+        foundPeak = true;
+      } else if (foundPeak && i > 0 && series[i][1] < series[i - 1][1]) {
+        // Past the peak, and now stock is dropping going backwards: we've
+        // crossed into a previous cycle. Stop so we measure THIS cycle only.
+        // Skipping this check until we've found a peak prevents breaking on
+        // the natural decline within the current sellout itself.
         break;
       }
     }
@@ -634,6 +638,10 @@
       nextRestockMs: null,
       rawRestockMs: null,
       restockPeak: null,
+      // Derived from the last completed sellout cycle: peak/duration. Used as
+      // a fallback when current sellRate can't be measured (low-volume item
+      // with no detectable decline in current snapshots).
+      historicalRatePerMin: null,
       confidence: 'low',
     };
     if (!series || series.length < MIN_POINTS_FOR_FIT) return result;
@@ -647,6 +655,9 @@
     // Falls back to current quantity if no full cycle is logged yet.
     const recent = lastSellout(series);
     result.restockPeak = recent ? recent.peak : Math.max(qty, 0);
+    if (recent && recent.durationMin > 0) {
+      result.historicalRatePerMin = recent.peak / recent.durationMin;
+    }
 
     if (qty <= 0) {
       result.state = 'empty';
@@ -916,22 +927,32 @@
     // now: it might be freshly restocked and about to drop, or sell rate
     // might be too low to detect over the few snapshots we have.
     //
-    // Be conservative: assume the current stock could deplete over a typical
-    // sellout window. For a long flight, even a modest rate adds up to a
-    // meaningful drop. The safety factor here pushes us toward "Risky" over
-    // "Go" when uncertain, which is the right default for fly-and-can't-undo.
+    // Prefer the historical rate from this item's last completed sellout
+    // cycle (peak/duration). That's data-driven and item-specific: a fast
+    // mover like Xanax gives a high rate, a slow mover gives a low rate.
+    // Falls back to a generic TYPICAL_SELLOUT_MIN heuristic when no cycle
+    // has been logged yet.
     const minsToLanding = (landMs - now) / 60000;
-    const assumedRate = stockItem.quantity / TYPICAL_SELLOUT_MIN; // items/min
+    const assumedRate = pred.historicalRatePerMin && pred.historicalRatePerMin > 0
+      ? pred.historicalRatePerMin
+      : stockItem.quantity / TYPICAL_SELLOUT_MIN;
+    const usingHistorical = pred.historicalRatePerMin > 0;
     const projected = Math.max(
       0,
       Math.round(stockItem.quantity - assumedRate * minsToLanding * DEPLETING_SAFETY_FACTOR)
     );
 
+    // Reason text changes slightly depending on the rate source, so the user
+    // can tell whether the projection is item-specific or a generic guess.
+    const rateNote = usingHistorical
+      ? `at this item's recent ~${assumedRate.toFixed(1)}/min sellout pace`
+      : `at a typical pace`;
+
     if (projected >= cap) {
       return {
         code: 'go',
         label: 'Go',
-        reason: `${stockItem.quantity} in stock, ~${projected} likely there on arrival`,
+        reason: `${stockItem.quantity} in stock, ~${projected} likely on arrival ${rateNote}`,
         expectedStockOnArrival: projected,
       };
     }
@@ -939,14 +960,14 @@
       return {
         code: 'risky',
         label: 'Risky',
-        reason: `${stockItem.quantity} in stock now, but only ~${projected} likely there after a ${formatTime(minsToLanding)} flight`,
+        reason: `${stockItem.quantity} in stock now, ~${projected} likely on arrival ${rateNote} (${formatTime(minsToLanding)} flight)`,
         expectedStockOnArrival: projected,
       };
     }
     return {
       code: 'skip',
       label: 'No fly',
-      reason: `${stockItem.quantity} in stock now but likely empty after a ${formatTime(minsToLanding)} flight`,
+      reason: `${stockItem.quantity} in stock now but likely empty ${rateNote} after ${formatTime(minsToLanding)}`,
       expectedStockOnArrival: 0,
     };
   }
