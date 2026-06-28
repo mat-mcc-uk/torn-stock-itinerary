@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.7.0
+// @version      2.8.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -197,40 +197,39 @@
   // Reads the observed flight-time cache first, falling back to the formula
   // (oneWayMin × FLIGHT_TIME_MULT × method × book) when no observation yet.
   // The cache is keyed per country/method/book so calibration is exact.
-  function effectiveOneWay(codeOrMin) {
-    // Backward-compat: callers may still pass a raw oneWayMin number (the
-    // ranking loop does). When given a string country code we use the cache.
-    if (typeof codeOrMin === 'string') {
-      const code = codeOrMin;
-      const key = code + ':' + travelMethod + (mailingBook ? ':book' : '');
-      const observed = observedFlightTimes[key];
-      if (typeof observed === 'number' && observed > 0) {
-        return observed;
-      }
-      // No observation: fall back to formula.
-      const country = COUNTRIES[code];
-      if (!country) return 0;
-      let mult = TRAVEL_METHODS[travelMethod].timeMult;
-      if (mailingBook) mult *= MAILING_BOOK_MULT;
-      return country.oneWayMin * FLIGHT_TIME_MULT * mult;
+  function effectiveOneWay(code) {
+    const key = code + ':' + travelMethod + (mailingBook ? ':book' : '');
+    const observed = observedFlightTimes[key];
+    if (typeof observed === 'number' && observed > 0) {
+      return observed;
     }
-    // Numeric input: legacy formula path (no code, can't check cache).
+    const country = COUNTRIES[code];
+    if (!country) return 0;
     let mult = TRAVEL_METHODS[travelMethod].timeMult;
     if (mailingBook) mult *= MAILING_BOOK_MULT;
-    return codeOrMin * FLIGHT_TIME_MULT * mult;
+    return country.oneWayMin * FLIGHT_TIME_MULT * mult;
   }
 
   // ---------------------------------------------------------------------
   // Data fetching
   // ---------------------------------------------------------------------
 
+  // Wrapper around GM_xmlhttpRequest. Adds a 15s timeout and a single retry
+  // for transient 5xx/network errors (the kind YATA throws on brief blips).
+  // Returns the parsed JSON body or rejects with a descriptive Error.
   function gmFetch(url, options = {}) {
-    return new Promise((resolve, reject) => {
+    const RETRY_DELAY_MS = 1500;
+    const isTransient = (err) =>
+      /\b(502|503|504)\b/.test(err.message) ||
+      /Network error|Timeout/.test(err.message);
+
+    const attempt = () => new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: options.method || 'GET',
         url,
         headers: options.headers,
         data: options.body,
+        timeout: 15000,
         onload: (response) => {
           if (response.status >= 200 && response.status < 300) {
             try {
@@ -245,6 +244,13 @@
         onerror: () => reject(new Error('Network error fetching ' + url)),
         ontimeout: () => reject(new Error('Timeout fetching ' + url)),
       });
+    });
+
+    return attempt().catch((err) => {
+      if (!isTransient(err)) throw err;
+      // One retry for transient failures, after a short delay.
+      return new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS))
+        .then(attempt);
     });
   }
 
@@ -261,10 +267,15 @@
   // the same flight on every poll. Just the destination + departed timestamp.
   let lastCalibratedFlight = null;
 
+  // True once we've successfully fetched stock data at least once. Used to
+  // distinguish "showing cached data" from "never had data" in error messages.
+  let hadStockData = false;
+
   async function fetchStockData() {
     const data = await gmFetch('https://yata.yt/api/v1/travel/export/');
     stockData = data.stocks || {};
     yataExportMs = typeof data.timestamp === 'number' ? data.timestamp * 1000 : null;
+    if (Object.keys(stockData).length > 0) hadStockData = true;
     return data.timestamp;
   }
 
@@ -330,8 +341,10 @@
       return { error: err.message || 'Network error' };
     }
   }
-  // money needs a Limited Access key; travel/basic are lower. If money is
-  // unreadable, userMoney stays null and only that filter no-ops.
+
+  // Pull cash, travel state, and status in a single call. money needs a
+  // Limited Access key; travel/basic are lower. If money is unreadable,
+  // userMoney stays null and only that filter no-ops.
   async function fetchUserState() {
     if (!TORN_API_KEY) return;
     try {
@@ -412,8 +425,11 @@
         const back = destCode ? effectiveOneWay(destCode) : 0;
         state.delayToTakeoffMin = flightLeftMin + back;
       }
-    } else if (stateStr === 'abroad' || /^in /.test(state.description.toLowerCase())) {
+    } else if (/^in /.test(state.description.toLowerCase())) {
       // Standing abroad: fly home before you can launch again.
+      // The Torn API doesn't have a dedicated "Abroad" state value; it
+      // returns state="Okay" with description like "In Mexico". So we
+      // detect "abroad" purely from the description text.
       state.location = 'abroad';
       const here = destCode ? effectiveOneWay(destCode) : 0;
       state.delayToTakeoffMin = here;
@@ -425,18 +441,39 @@
     return state;
   }
 
-  // Persist an observed flight time, blended with any prior observation for
-  // the same country/method/book combination. We exponentially smooth so one
-  // anomalous reading doesn't overwrite a settled estimate.
+  // Persist an observed flight time, taking the median of recent observations
+  // rather than blending each new reading in. Torn's wiki documents a built-in
+  // 3% variance on every flight, so a single outlier shouldn't pull the
+  // estimate. A median over the last 5 readings is robust to one or two freak
+  // values while still adapting if Torn changes the underlying times.
+  //
+  // Storage shape: each key maps to a number (the median). A sibling key
+  // ending ':samples' stores the rolling sample buffer.
+  const FLIGHT_SAMPLES_PER_KEY = 5;
   function recordFlightTime(code, method, withBook, observedMin) {
     const key = code + ':' + method + (withBook ? ':book' : '');
+    const samplesKey = key + ':samples';
+    let samples = Array.isArray(observedFlightTimes[samplesKey])
+      ? observedFlightTimes[samplesKey].slice()
+      : [];
+    samples.push(observedMin);
+    if (samples.length > FLIGHT_SAMPLES_PER_KEY) {
+      samples = samples.slice(-FLIGHT_SAMPLES_PER_KEY);
+    }
+    observedFlightTimes[samplesKey] = samples;
+    // Sort a copy to compute median without mutating sample order.
+    const sorted = samples.slice().sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    const newMedian = sorted.length % 2 === 0
+      ? (sorted[mid - 1] + sorted[mid]) / 2
+      : sorted[mid];
     const prev = observedFlightTimes[key];
-    const blended = prev == null ? observedMin : prev * 0.5 + observedMin * 0.5;
-    observedFlightTimes[key] = blended;
+    observedFlightTimes[key] = newMedian;
     GM_setValue('observedFlightTimes', observedFlightTimes);
     console.log(
       `Calibrated flight time ${key}: ${observedMin.toFixed(2)}m ` +
-      `(stored ${blended.toFixed(2)}m, was ${prev == null ? 'unset' : prev.toFixed(2) + 'm'})`
+      `(median over ${samples.length} samples = ${newMedian.toFixed(2)}m, ` +
+      `was ${prev == null ? 'unset' : prev.toFixed(2) + 'm'})`
     );
   }
 
@@ -481,8 +518,6 @@
     }
   }
 
-  // Append the current snapshot. Records zero-stock readings too, since the
-  // moment stock hits zero is what anchors a restock prediction.
   // ---------------------------------------------------------------------
   // Cycle history: per-item record of completed empty->restock cycles.
   // Used by the per-item prediction model to learn item-specific timing.
@@ -519,17 +554,48 @@
   // append any newly completed cycles to cycleHistory. Called from
   // recordSnapshot. We use the existing time series rather than tracking
   // transitions live, so this works even when cycle history starts empty.
+  //
+  // Performance: we only need to scan the tail of the series since the last
+  // call. cycleHistory tracks the timestamp of the last point we scanned per
+  // key, so on a typical snapshot we look at 1-2 new points, not all 200+.
   function detectAndRecordCycle(key, series, now) {
-    if (!series || series.length < 3) return;
     const ch = loadCycleHistory();
+
+    // Expire stale pending predictions unconditionally (before any early
+    // returns): if a pending entry's emptiedAt is older than the history
+    // window, the cycle can never be matched (history points have been
+    // trimmed), so drop it to free storage.
+    const pendingKey = key + ':pending';
+    const stalePending = ch[pendingKey];
+    if (stalePending && stalePending.emptiedAt && now - stalePending.emptiedAt > HISTORY_WINDOW_MS) {
+      delete ch[pendingKey];
+      saveCycleHistory(ch);
+    }
+
+    if (!series || series.length < 3) return;
     if (!ch[key]) ch[key] = [];
     const existing = ch[key];
     const lastRecorded = existing.length > 0 ? existing[existing.length - 1].restockedMs : 0;
 
-    // Walk the series looking for a transition from 0 -> >0 (a restock).
-    // Then look backwards from there to find when stock first hit 0 (emptied),
-    // and before that the peak that preceded the empty period.
-    for (let i = 1; i < series.length; i++) {
+    // Start scanning from one step before our last-scanned timestamp, so we
+    // can still see a 0->positive transition that straddles the boundary.
+    // First call (scannedToMs unset) walks the whole series.
+    const scanMetaKey = key + ':scan';
+    const scannedToMs = ch[scanMetaKey] && ch[scanMetaKey].ts ? ch[scanMetaKey].ts : 0;
+    let startIdx = 1;
+    if (scannedToMs > 0) {
+      // Find first index whose timestamp is >= scannedToMs. Binary search
+      // would be ideal but linear is fine for typical 50-200 point series.
+      for (let i = series.length - 1; i >= 1; i--) {
+        if (series[i - 1][0] < scannedToMs) {
+          startIdx = i;
+          break;
+        }
+      }
+    }
+
+    // Walk the (un-scanned tail of the) series looking for 0 -> >0 transitions.
+    for (let i = startIdx; i < series.length; i++) {
       const prevQty = series[i - 1][1];
       const curQty = series[i][1];
       if (prevQty > 0 || curQty <= 0) continue; // not a restock transition
@@ -587,10 +653,16 @@
       }
     }
 
+    // Record our scan progress for next call.
+    if (series.length > 0) {
+      ch[scanMetaKey] = { ts: series[series.length - 1][0] };
+    }
+
     // Trim oldest cycles beyond cap.
     if (existing.length > MAX_CYCLES_PER_ITEM) {
       existing.splice(0, existing.length - MAX_CYCLES_PER_ITEM);
     }
+
     saveCycleHistory(ch);
   }
 
@@ -662,9 +734,11 @@
     // Use the most recent N cycles (more weight on recent behaviour).
     const recent = cycles.slice(-15);
 
-    // Observed wait per cycle.
+    // Observed wait per cycle, and the ratio of wait to sellout duration.
     const waits = recent.map((c) => (c.restockedMs - c.emptiedMs) / 60000);
-    const ratios = recent.map((c, i) => waits[i] / c.selloutDurationMin);
+    const ratios = recent.map((c) =>
+      (c.restockedMs - c.emptiedMs) / 60000 / c.selloutDurationMin
+    );
 
     // Fixed-wait model: median wait, MAD as spread.
     const fixedWait = median(waits);
@@ -691,11 +765,12 @@
       }
     }
 
-    // Accuracy: compare each cycle's predicted-vs-actual restock time.
-    // Cycles with no prediction logged contribute nothing.
+    // Accuracy: compare each cycle's predicted tick (the snapped value the
+    // user actually saw) against the actual restock time. Cycles with no
+    // prediction logged contribute nothing.
     const errors = recent
-      .filter((c) => c.predicted && typeof c.predicted.rawMs === 'number')
-      .map((c) => (c.predicted.rawMs - c.restockedMs) / 60000);
+      .filter((c) => c.predicted && typeof c.predicted.tickMs === 'number')
+      .map((c) => (c.predicted.tickMs - c.restockedMs) / 60000);
     const accuracyMin = errors.length > 0
       ? errors.reduce((a, b) => a + Math.abs(b), 0) / errors.length
       : null;
@@ -713,6 +788,10 @@
     };
   }
 
+  // Append the current snapshot for every tracked country/item to history.
+  // Records zero-stock readings too, since the moment stock hits zero is what
+  // anchors a restock prediction. Also detects any completed cycle and pushes
+  // it into cycleHistory for the per-item learning model.
   function recordSnapshot(now) {
     const hist = loadHistory();
     const cutoff = now - HISTORY_WINDOW_MS;
@@ -861,6 +940,24 @@
     return { durationMin, peak: peakVal };
   }
 
+  // Confidence tier given how much data backs a prediction. Used by both the
+  // empty and depleting branches so they apply the same standards. Stale
+  // YATA data (5+ min old) caps confidence at low; somewhat stale (2-5 min)
+  // caps at medium.
+  function predictionConfidence(seriesLength, cycleCount) {
+    let tier;
+    if (cycleCount >= 5 && seriesLength >= CONF_HIGH_POINTS) tier = 'high';
+    else if (cycleCount >= 2 || seriesLength >= CONF_MEDIUM_POINTS) tier = 'medium';
+    else tier = 'low';
+
+    if (yataExportMs !== null) {
+      const ageMin = (Date.now() - yataExportMs) / 60000;
+      if (ageMin >= 5) tier = 'low';
+      else if (ageMin >= 2 && tier === 'high') tier = 'medium';
+    }
+    return tier;
+  }
+
   // Produce a prediction object for one item's series given current qty.
   //   { state, qty, sellRate, etaEmptyMin, nextRestockMs, confidence, model }
   // state: 'learning' | 'in-stock' | 'depleting' | 'empty'
@@ -929,23 +1026,10 @@
         result.nextRestockMs = nextTick(result.rawRestockMs);
       }
 
-      // Confidence: blended signal from cycle count and series length.
+      // Confidence: blended signal from cycle count, series length, and YATA
+      // data age. Single helper keeps empty and depleting states consistent.
       const cycleCount = model ? model.samples : 0;
-      let confTier = cycleCount >= 5 && series.length >= CONF_HIGH_POINTS ? 'high'
-        : cycleCount >= 2 || series.length >= CONF_MEDIUM_POINTS ? 'medium'
-        : 'low';
-
-      // Downgrade confidence if YATA data is stale. Crowd-sourced data 5+
-      // min old means we're predicting on yesterday's news.
-      if (yataExportMs !== null) {
-        const ageMin = (Date.now() - yataExportMs) / 60000;
-        if (ageMin >= 5) {
-          confTier = 'low';
-        } else if (ageMin >= 2 && confTier === 'high') {
-          confTier = 'medium';
-        }
-      }
-      result.confidence = confTier;
+      result.confidence = predictionConfidence(series.length, cycleCount);
 
       // Record this prediction against the active empty period so we can
       // score it against the actual restock time later. Only the first
@@ -959,11 +1043,10 @@
     if (rate && rate > 0) {
       result.state = 'depleting';
       result.etaEmptyMin = qty / rate;
-      // Same tiered confidence as empty state, so depleting predictions are
-      // held to the same evidence bar.
-      result.confidence = series.length >= CONF_HIGH_POINTS ? 'high'
-        : series.length >= CONF_MEDIUM_POINTS ? 'medium'
-        : 'low';
+      // Same confidence formula as empty state, so depleting predictions are
+      // held to the same evidence bar (and downgrade for stale YATA data too).
+      const cycleCount = model ? model.samples : 0;
+      result.confidence = predictionConfidence(series.length, cycleCount);
     } else {
       result.state = 'in-stock';
     }
@@ -1023,11 +1106,16 @@
         // Watchlist filter: when on, only watched items pass.
         if (watchlistFilter && !isWatched) continue;
 
-        // Capacity you'd fill if stock allowed it.
-        const stockCapacity = Math.min(
-          effectiveCapacity(),
-          Math.max(stockItem.quantity, verdict.expectedStockOnArrival || 0)
-        );
+        // Capacity you'd fill if stock allowed it. The verdict's projection
+        // of stock-on-arrival is the honest figure - if it says zero will be
+        // there, don't pretend current quantity will be. Falls back to current
+        // quantity only when the verdict didn't compute a projection (e.g.
+        // learning state where we don't know yet).
+        const expectedOnArrival = verdict.expectedStockOnArrival;
+        const stockForCapacity = expectedOnArrival != null
+          ? expectedOnArrival
+          : stockItem.quantity;
+        const stockCapacity = Math.min(effectiveCapacity(), Math.max(0, stockForCapacity));
 
         // Affordability: how many you can pay for with cash on hand. Only
         // applies when money is known and the item has a buy cost.
@@ -1094,7 +1182,7 @@
 
   // Decide whether to fly for an item right now, given its prediction and the
   // one-way time to the country. Returns a verdict with a short reason.
-  //   code: 'go' | 'wait' | 'risky' | 'learning' | 'skip'
+  //   code: 'go' | 'risky' | 'learning' | 'skip'
   function adviseFlight(stockItem, pred, oneWayMin, now, takeoffDelayMin = 0) {
     // Landing time = wait to take off (get home if abroad) + the flight itself.
     const landMs = now + (takeoffDelayMin + oneWayMin) * 60000;
@@ -1122,8 +1210,19 @@
         // Minutes the shelf sells for between restock and your arrival.
         const sellMinAfterRestock = Math.max(0, (landMs - pred.nextRestockMs) / 60000);
         const peak = pred.restockPeak || 0;
-        const rate = pred.sellRate || 0;
-        const projected = Math.max(0, Math.round(peak - rate * sellMinAfterRestock));
+        // Use historical sellout rate (peak/duration from last full cycle)
+        // rather than the recency-weighted current-decline rate. The current
+        // decline ended at zero, so the rate fit is noisier than the cleaner
+        // peak/duration ratio. Falls back to sellRate, then to 0.
+        const rate = pred.historicalRatePerMin > 0
+          ? pred.historicalRatePerMin
+          : pred.sellRate || 0;
+        // Apply the same safety factor as depleting projections: bursty
+        // buyers can clear faster than the historical rate suggests.
+        const projected = Math.max(
+          0,
+          Math.round(peak - rate * sellMinAfterRestock * DEPLETING_SAFETY_FACTOR)
+        );
 
         if (projected >= cap) {
           return {
@@ -1206,10 +1305,10 @@
     // Falls back to a generic TYPICAL_SELLOUT_MIN heuristic when no cycle
     // has been logged yet.
     const minsToLanding = (landMs - now) / 60000;
-    const assumedRate = pred.historicalRatePerMin && pred.historicalRatePerMin > 0
+    const usingHistorical = pred.historicalRatePerMin > 0;
+    const assumedRate = usingHistorical
       ? pred.historicalRatePerMin
       : stockItem.quantity / TYPICAL_SELLOUT_MIN;
-    const usingHistorical = pred.historicalRatePerMin > 0;
     const projected = Math.max(
       0,
       Math.round(stockItem.quantity - assumedRate * minsToLanding * DEPLETING_SAFETY_FACTOR)
@@ -1348,7 +1447,6 @@
     #tsi-panel.tsi-dragging {
       box-shadow: 0 4px 20px rgba(90,160,240,0.4);
       opacity: 0.95;
-      transition: none;
     }
     #tsi-panel .tsi-body { padding: 8px 10px; }
     #tsi-panel table { width: 100%; border-collapse: collapse; }
@@ -1691,10 +1789,39 @@
       document.getElementById('tsi-settings').classList.toggle('tsi-settings-hidden');
     });
 
-    document.getElementById('tsi-save-key').addEventListener('click', () => {
+    document.getElementById('tsi-save-key').addEventListener('click', async () => {
+      const btn = document.getElementById('tsi-save-key');
       const val = document.getElementById('tsi-key').value.trim();
-      GM_setValue('tornApiKey', val);
-      location.reload();
+      // Empty string explicitly clears the key (and skips the test).
+      if (!val) {
+        GM_setValue('tornApiKey', '');
+        location.reload();
+        return;
+      }
+      const origLabel = btn.textContent;
+      btn.textContent = 'Testing...';
+      btn.disabled = true;
+      try {
+        // Light validation call: just the basic user record. If the key is
+        // bogus, Torn returns an error object; if it's valid but missing
+        // money permission, we still save it (the affordability filter just
+        // no-ops, which the script already handles).
+        const data = await gmFetch(
+          'https://api.torn.com/user/?selections=basic&key=' + val
+        );
+        if (data.error) {
+          btn.textContent = origLabel;
+          btn.disabled = false;
+          alert('Torn rejected the key: ' + data.error.error + '\n\nNot saved.');
+          return;
+        }
+        GM_setValue('tornApiKey', val);
+        location.reload();
+      } catch (err) {
+        btn.textContent = origLabel;
+        btn.disabled = false;
+        alert('Could not reach the Torn API to verify the key: ' + (err.message || err) + '\n\nNot saved. Check your connection.');
+      }
     });
 
     document.getElementById('tsi-key-show').addEventListener('click', () => {
@@ -2010,6 +2137,11 @@
     `;
   }
 
+  // The expandedCharts set and panelPosition live here (mid-file) rather than
+  // grouped with other state at the top, because they're tightly coupled to
+  // the UI rendering below and reading them in flow with their callers makes
+  // the rendering code easier to follow.
+
   // Track which item rows have their chart expanded, so the chart survives the
   // periodic re-render. Keyed by countryCode:itemId. Persisted to storage so
   // expansions survive page reloads and PDA navigation.
@@ -2037,7 +2169,6 @@
     const PANEL_MARGIN_PX = 40; // min visible drag target on any edge
     const rect = panelEl.getBoundingClientRect();
     const w = rect.width || 320;
-    const h = rect.height || 40;
     const vw = window.innerWidth;
     const vh = window.innerHeight;
     return {
@@ -2253,11 +2384,25 @@
   // Refresh loop
   // ---------------------------------------------------------------------
 
+  // Set while a refresh is in progress, so concurrent calls (from the
+  // MutationObserver re-injecting the panel while a refresh is mid-flight)
+  // don't duplicate API calls or interleave renders.
+  let refreshInFlight = false;
+
   async function refreshAll() {
+    if (refreshInFlight) return;
     const panel = document.getElementById('tsi-panel');
     // No panel at all means we navigated away within the SPA; nothing to do.
     if (!panel) return;
+    refreshInFlight = true;
+    try {
+      await refreshAllImpl(panel);
+    } finally {
+      refreshInFlight = false;
+    }
+  }
 
+  async function refreshAllImpl(panel) {
     // Each fetch is independent: YATA stock, Torn item prices, user state.
     // Use allSettled so a single failure (typically YATA going 502 for a few
     // minutes) doesn't blank the whole panel. We render with whatever did
@@ -2293,9 +2438,11 @@
         // message in place, since it carries more info than just a timestamp.
       } else if (failed.includes('YATA stock')) {
         // YATA is a third-party service; flag clearly so it doesn't look like
-        // a script bug. Other services have their own messages.
-        dom.status.textContent =
-          'YATA temporarily unreachable. Showing last known stock. Retrying next refresh.';
+        // a script bug. Other services have their own messages. Don't claim to
+        // be showing "last known" stock if we never had any to begin with.
+        dom.status.textContent = hadStockData
+          ? 'YATA temporarily unreachable. Showing last known stock. Retrying next refresh.'
+          : 'YATA unreachable. Waiting for first successful fetch (retrying every minute).';
       } else {
         dom.status.textContent = 'Partial update: ' + failed.join(', ') + ' failed';
       }
