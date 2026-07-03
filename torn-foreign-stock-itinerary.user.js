@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.8.0
+// @version      2.10.0
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -102,7 +102,13 @@
   // 0.5 was the community-accepted value pre-December-2025. Torn changed
   // restock mechanics in that update and the new ratio varies by item, so
   // this is now user-tunable in settings.
-  let restockRatio = GM_getValue('restockRatio', 0.5);
+  // Starting prior for the restock-wait ratio (wait = sellout duration ×
+  // ratio). Only used for items with fewer than 3 observed cycles; after
+  // that the per-item model takes over and this value is ignored. The old
+  // user-facing setting was removed because a single global number can't be
+  // right for all items post-Dec-2025, and the per-item model learns the
+  // real value automatically.
+  const RESTOCK_RATIO_PRIOR = 0.5;
   const MIN_POINTS_FOR_FIT = 4;                   // need this many to trust a rate
   const MIN_DECLINE_FOR_FIT = 30;                 // and this much total drop (items)
 
@@ -124,11 +130,6 @@
   // when measuring a sellout cycle. Allows for a stray reading or two of
   // residual stock that other players haven't grabbed.
   const NEAR_ZERO_FRACTION = 0.02;
-
-  // Bounds on the user-tunable restock ratio. 0.1 to 2.0 covers plausible
-  // values; outside this we ignore the input as a typo.
-  const RESTOCK_RATIO_MIN = 0.1;
-  const RESTOCK_RATIO_MAX = 2.0;
 
   // Confidence thresholds for empty-state predictions (history points).
   const CONF_HIGH_POINTS = 20;
@@ -157,6 +158,13 @@
   // prediction more than a day out will be invalidated by the next restock
   // before it could ever come true.
   const LONG_ETA_THRESHOLD_MIN = 24 * 60;
+
+  // History thinning: keep full snapshot resolution for the recent window,
+  // compact anything older onto a coarser grid. Zero transitions always
+  // survive because cycle detection anchors on them. Cuts the per-refresh
+  // JSON.stringify cost roughly in half on a mature 48h history.
+  const DOWNSAMPLE_AFTER_MS = 12 * 60 * 60 * 1000; // full detail for 12h
+  const DOWNSAMPLE_GRID_MS = 5 * 60 * 1000;        // then one point per 5min
 
   // ---------------------------------------------------------------------
   // State
@@ -550,6 +558,18 @@
     }
   }
 
+  // detectAndRecordCycle runs once per item per snapshot (227 times a minute
+  // on a full watch list). Serialising the whole cycle-history object on each
+  // call cost more CPU than everything else combined, so mutations now set
+  // this flag and recordSnapshot flushes once at the end of its loop.
+  let cycleHistoryDirty = false;
+
+  function flushCycleHistory() {
+    if (!cycleHistoryDirty) return;
+    cycleHistoryDirty = false;
+    saveCycleHistory(loadCycleHistory());
+  }
+
   // Detect emptied->restocked transitions in a single item's series and
   // append any newly completed cycles to cycleHistory. Called from
   // recordSnapshot. We use the existing time series rather than tracking
@@ -569,7 +589,7 @@
     const stalePending = ch[pendingKey];
     if (stalePending && stalePending.emptiedAt && now - stalePending.emptiedAt > HISTORY_WINDOW_MS) {
       delete ch[pendingKey];
-      saveCycleHistory(ch);
+      cycleHistoryDirty = true;
     }
 
     if (!series || series.length < 3) return;
@@ -663,7 +683,7 @@
       existing.splice(0, existing.length - MAX_CYCLES_PER_ITEM);
     }
 
-    saveCycleHistory(ch);
+    cycleHistoryDirty = true;
   }
 
   // ---------------------------------------------------------------------
@@ -684,6 +704,21 @@
     if (m === null) return null;
     const deviations = arr.map((x) => Math.abs(x - m));
     return median(deviations);
+  }
+
+  // Median sellout rate (items/min) across an item's recorded cycles. One
+  // freak cycle, say a faction bulk-buy or a YATA outage mid-sellout, skews a
+  // single-cycle rate badly; the median over up to 15 cycles shrugs it off.
+  // Returns null with fewer than 3 usable cycles so callers can fall back to
+  // the single most recent cycle.
+  function medianHistoricalRate(key) {
+    const cycles = loadCycleHistory()[key];
+    if (!cycles || cycles.length < 3) return null;
+    const rates = cycles.slice(-15)
+      .filter((c) => c.selloutDurationMin > 0 && c.peak > 0)
+      .map((c) => c.peak / c.selloutDurationMin);
+    if (rates.length < 3) return null;
+    return median(rates);
   }
 
   // Stash a prediction against the active empty period for this item, so
@@ -727,7 +762,7 @@
     const ch = loadCycleHistory();
     const cycles = ch[key];
     if (!cycles || cycles.length === 0) {
-      return { source: 'global', ratio: restockRatio, fixedWaitMin: null,
+      return { source: 'global', ratio: RESTOCK_RATIO_PRIOR, fixedWaitMin: null,
                samples: 0, accuracyMin: null, drift: null };
     }
 
@@ -753,7 +788,7 @@
     // Need at least 3 cycles before trusting a per-item model. Below that,
     // global ratio is more reliable than an undertrained per-item estimate.
     let source = 'global';
-    let chosenRatio = restockRatio;
+    let chosenRatio = RESTOCK_RATIO_PRIOR;
     let chosenFixed = null;
     if (recent.length >= 3) {
       if (fixedSpread !== null && ratioSpread !== null && fixedSpread <= ratioSpread) {
@@ -816,13 +851,43 @@
         // Trim to window.
         while (series.length && series[0][0] < cutoff) series.shift();
 
+        // Thin old points onto the coarse grid. Zero transitions survive
+        // regardless of spacing: dropping them would corrupt cycle detection
+        // and sellout measurement. Peaks inside old cycles can lose a little
+        // height precision; recorded cycles in cycleHistory already captured
+        // them at full resolution, so nothing downstream re-derives from here.
+        const oldCutoff = now - DOWNSAMPLE_AFTER_MS;
+        if (series.length > 2 && series[0][0] < oldCutoff) {
+          const thinned = [];
+          for (let i = 0; i < series.length; i++) {
+            const p = series[i];
+            if (p[0] >= oldCutoff) {
+              thinned.push(p);
+              continue;
+            }
+            const prevKept = thinned[thinned.length - 1];
+            const prevOrig = series[i - 1];
+            const zeroTransition = prevOrig &&
+              ((p[1] === 0 && prevOrig[1] > 0) || (p[1] > 0 && prevOrig[1] === 0));
+            if (!prevKept || zeroTransition || p[0] - prevKept[0] >= DOWNSAMPLE_GRID_MS) {
+              thinned.push(p);
+            }
+          }
+          if (thinned.length < series.length) {
+            hist[key] = thinned;
+          }
+        }
+
         // Detect any completed empty->restock cycle and record it. Cheap
-        // because it only walks the series once per snapshot.
-        detectAndRecordCycle(key, series, now);
+        // because it only walks the tail since the last scan.
+        detectAndRecordCycle(key, hist[key], now);
       }
     }
 
     saveHistory(hist);
+    // One cycle-history write per refresh, covering every item the loop above
+    // touched. Replaces the old per-item save.
+    flushCycleHistory();
     return hist;
   }
 
@@ -988,6 +1053,12 @@
     if (recent && recent.durationMin > 0) {
       result.historicalRatePerMin = recent.peak / recent.durationMin;
     }
+    // With 3+ recorded cycles, the median rate across them replaces the
+    // single-cycle figure. Same robustness upgrade the flight calibration got.
+    if (itemKey) {
+      const medRate = medianHistoricalRate(itemKey);
+      if (medRate !== null) result.historicalRatePerMin = medRate;
+    }
 
     // Per-item model: chosen between ratio and fixed-wait based on which has
     // tighter agreement across observed cycles. Falls back to the global
@@ -1007,7 +1078,7 @@
       } else if (recent) {
         // Ratio model: wait proportional to sellout duration. Uses per-item
         // ratio when available, falls back to global.
-        const ratio = model && model.source === 'ratio' ? model.ratio : restockRatio;
+        const ratio = model && model.source === 'ratio' ? model.ratio : RESTOCK_RATIO_PRIOR;
         const waitMin = recent.durationMin * ratio;
         result.rawRestockMs = emptiedAt + waitMin * 60000;
         result.nextRestockMs = nextTick(result.rawRestockMs);
@@ -1164,17 +1235,21 @@
       }
     }
 
-    // Watched first, then Go verdicts above Wait/Risky, then by profit/hour.
+    // Watched first, then Go verdicts above Risky, then by profit in the
+    // user's chosen display mode. Sorting by the same field the column shows
+    // keeps the ranking and the numbers in agreement; per-trip mode favours
+    // long hauls with big loads, per-hour favours quick turnarounds.
     const order = { go: 0, risky: 1, learning: 2, skip: 3 };
+    const profitField = profitMode === 'trip' ? 'profitPerTrip' : 'profitPerHour';
     rows.sort((a, b) => {
       if (a.isWatched !== b.isWatched) return a.isWatched ? -1 : 1;
       const oa = order[a.verdict.code] ?? 5;
       const ob = order[b.verdict.code] ?? 5;
       if (oa !== ob) return oa - ob;
-      if (a.profitPerHour === null && b.profitPerHour === null) return 0;
-      if (a.profitPerHour === null) return 1;
-      if (b.profitPerHour === null) return -1;
-      return b.profitPerHour - a.profitPerHour;
+      if (a[profitField] === null && b[profitField] === null) return 0;
+      if (a[profitField] === null) return 1;
+      if (b[profitField] === null) return -1;
+      return b[profitField] - a[profitField];
     });
 
     return rows;
@@ -1602,14 +1677,6 @@
             </span>
           </div>
           <div>
-            Restock ratio:
-            <input id="tsi-restockratio" type="number" min="${RESTOCK_RATIO_MIN}" max="${RESTOCK_RATIO_MAX}" step="0.05"
-                   style="width:55px" value="${restockRatio}">
-            <span style="color:#888;font-size:10px">
-              Refill ≈ sellout × ratio. 0.5 is the old norm; Torn's Dec 2025 change altered this. Tune by observation.
-            </span>
-          </div>
-          <div>
             Country:
             <select id="tsi-country" style="width:150px">
               <option value="all"${countryFilter === 'all' ? ' selected' : ''}>All countries</option>
@@ -1898,16 +1965,6 @@
       if (!isNaN(val) && val >= 0 && val <= 30) {
         sellDiscount = val;
         GM_setValue('sellDiscount', sellDiscount);
-        renderTable();
-      }
-    });
-
-    document.getElementById('tsi-restockratio').addEventListener('input', (e) => {
-      const val = parseFloat(e.target.value);
-      if (!isNaN(val) && val >= RESTOCK_RATIO_MIN && val <= RESTOCK_RATIO_MAX) {
-        restockRatio = val;
-        GM_setValue('restockRatio', restockRatio);
-        // renderTable re-runs predictItem, so the new ratio takes effect now.
         renderTable();
       }
     });
