@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.10.2
+// @version      2.10.3
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -371,9 +371,12 @@
       }
       userMoney = typeof data.money_onhand === 'number' ? data.money_onhand : null;
       travelState = deriveTravelState(data, Date.now());
-      // Faction check: basic selection always returns faction.faction_id.
-      // null means no faction — definitely not authorised.
-      const factionId = data.faction?.faction_id ?? null;
+      // Faction check. Use Number() so a string "51896" matches the numeric constant.
+      // Log what we get so mismatches are easy to diagnose.
+      const factionId = data.faction?.faction_id != null
+        ? Number(data.faction.faction_id)
+        : null;
+      console.log('[TSI] faction check — got:', factionId, 'expected:', ALLOWED_FACTION_ID, 'raw faction:', data.faction);
       userAuthorised = factionId === ALLOWED_FACTION_ID;
     } catch (err) {
       console.warn('User fetch error:', err);
