@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.10.0
+// @version      2.10.2
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -26,6 +26,9 @@
   // ---------------------------------------------------------------------
 
   const TORN_API_KEY = GM_getValue('tornApiKey', '');
+  // Only members of this faction see live data. Anyone else sees a locked panel.
+  // Not a setting — hardcoded so it cannot be bypassed through the UI.
+  const ALLOWED_FACTION_ID = 51896;
   const REFRESH_MS = 60 * 1000;
 
   // Items the user always wants surfaced regardless of profit ranking.
@@ -173,6 +176,7 @@
   let itemPrices = {};      // itemId -> { name, market_value }
   let stockData = {};       // countryCode -> [{ id, name, quantity, cost }]
   let userMoney = null;     // cash on hand, null = unknown (no permission/key)
+  let userAuthorised = null; // null = not yet checked, true = in faction, false = not
   // Travel state derived from the Torn API. delayToTakeoffMin is how long until
   // you could next take off from Torn (get home + land). null = unknown.
   let travelState = { location: 'unknown', delayToTakeoffMin: 0, description: '' };
@@ -367,6 +371,10 @@
       }
       userMoney = typeof data.money_onhand === 'number' ? data.money_onhand : null;
       travelState = deriveTravelState(data, Date.now());
+      // Faction check: basic selection always returns faction.faction_id.
+      // null means no faction — definitely not authorised.
+      const factionId = data.faction?.faction_id ?? null;
+      userAuthorised = factionId === ALLOWED_FACTION_ID;
     } catch (err) {
       console.warn('User fetch error:', err);
       userMoney = null;
@@ -1214,6 +1222,20 @@
           stockItem.cost > 0 &&
           affordableUnits < stockCapacity;
 
+        // A full shelf means nothing when each unit sells at or below its
+        // shop cost. Override the availability verdict once the margin is
+        // known and non-positive. Null margins (no API key, no price data)
+        // keep their original verdict.
+        let rowVerdict = verdict;
+        if (profitPerItem !== null && profitPerItem <= 0) {
+          rowVerdict = {
+            code: 'skip',
+            label: 'No fly',
+            reason: `No profit: ${formatMoney(profitPerItem)} margin per unit`,
+            expectedStockOnArrival: verdict.expectedStockOnArrival,
+          };
+        }
+
         rows.push({
           country: country.name,
           countryCode: code,
@@ -1230,7 +1252,7 @@
           itemsAvailable,
           cashLimited,
           pred,
-          verdict,
+          verdict: rowVerdict,
         });
       }
     }
@@ -2486,6 +2508,20 @@
 
     // Skip the heavy render work when the panel is collapsed.
     if (panel.classList.contains('tsi-collapsed')) return;
+
+    // Faction gate: if the API key belongs to someone outside the faction,
+    // show a locked state instead of stock data. userAuthorised is null when
+    // no API key is set — in that case we still render (predictions still work
+    // without a key; the user just won't see profit figures).
+    if (userAuthorised === false) {
+      if (dom.status) {
+        dom.status.textContent = 'Not authorised. This tool is for faction members only.';
+        dom.status.style.color = '#f0a0a0';
+      }
+      if (dom.tbody) dom.tbody.innerHTML = '';
+      if (dom.bestpick) dom.bestpick.style.display = 'none';
+      return;
+    }
 
     renderTable(hist, now);
 
