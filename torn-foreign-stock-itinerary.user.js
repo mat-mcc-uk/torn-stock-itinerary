@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.10.6
+// @version      2.10.7
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -1788,17 +1788,32 @@
         </table>
       </div>
     `;
-    // Inject inline below the inventory grid when possible, fall back to
-    // floating fixed position. The aria-label selector is stable across Torn
-    // CSS module hash changes, making it the safest anchor available.
-    const inventoryEl = document.querySelector('ul[aria-label^="Inventory"]');
-    const isInline = !!inventoryEl;
-
-    if (isInline) {
+    // Try to inject inline below the inventory grid. The grid is React-rendered
+    // so it may not exist yet when buildPanel runs. Strategy:
+    //   1. Check immediately — injects inline if the element is already there.
+    //   2. If not, append to body as a floating panel and watch for the
+    //      inventory to appear, then move the panel inline. Moving an existing
+    //      DOM element with .after() preserves all event listeners.
+    const tryInline = () => {
+      const inv = document.querySelector('ul[aria-label^="Inventory"]');
+      if (!inv || panel.classList.contains('tsi-inline')) return false;
       panel.classList.add('tsi-inline');
-      inventoryEl.after(panel);
-    } else {
+      // Clear any inline position styles left from floating mode.
+      panel.style.left = ''; panel.style.top = '';
+      panel.style.right = ''; panel.style.bottom = '';
+      inv.after(panel);
+      return true;
+    };
+
+    const isInline = tryInline();
+
+    if (!isInline) {
       document.body.appendChild(panel);
+      // Watch for React to mount the inventory and upgrade inline when it does.
+      const upgradeObs = new MutationObserver(() => {
+        if (tryInline()) upgradeObs.disconnect();
+      });
+      upgradeObs.observe(document.body, { childList: true, subtree: true });
     }
 
     // Collapse behaviour differs between modes:
@@ -2284,6 +2299,9 @@
   // by setting bottom/right to auto inline, otherwise the panel renders at
   // the intersection of all four constraints (and gets stretched).
   function applyPanelPosition(panel, pos) {
+    // No-op in inline mode — position is controlled by document flow, not
+    // inline styles, so setting left/top would override position:static.
+    if (panel.classList.contains('tsi-inline')) return;
     if (!pos) {
       panel.style.left = '';
       panel.style.top = '';
