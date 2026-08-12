@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.10.7
+// @version      2.10.8
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -1795,7 +1795,12 @@
     //      inventory to appear, then move the panel inline. Moving an existing
     //      DOM element with .after() preserves all event listeners.
     const tryInline = () => {
-      const inv = document.querySelector('ul[aria-label^="Inventory"]');
+      // Two anchor candidates in priority order:
+      // 1. Inventory grid on the traveling page (fish icons).
+      // 2. Info-message wrapper on the travel agency landing page.
+      const inv = document.querySelector(
+        'ul[aria-label^="Inventory"], div.info-msg.border-round'
+      );
       if (!inv || panel.classList.contains('tsi-inline')) return false;
       panel.classList.add('tsi-inline');
       // Clear any inline position styles left from floating mode.
