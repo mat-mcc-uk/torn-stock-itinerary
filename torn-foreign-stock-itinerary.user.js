@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.10.5
+// @version      2.10.6
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -1471,6 +1471,7 @@
   // ---------------------------------------------------------------------
 
   GM_addStyle(`
+    /* ---- Floating mode (default / fallback) ---- */
     #tsi-panel {
       position: fixed;
       /* Dock to bottom-right above Torn's chat tabs (~50px tall). Avoids
@@ -1490,6 +1491,19 @@
       z-index: 9999;
       box-shadow: 0 2px 10px rgba(0,0,0,0.5);
     }
+    /* ---- Inline mode: injected below the inventory grid ---- */
+    #tsi-panel.tsi-inline {
+      position: static;
+      bottom: auto; right: auto;
+      width: 100%;
+      max-width: 100%;
+      max-height: none;
+      overflow-y: visible;
+      border-radius: 0;
+      box-shadow: none;
+      z-index: auto;
+      margin-top: 4px;
+    }
     /* When collapsed, only the header bar shows. */
     #tsi-panel.tsi-collapsed { overflow: hidden; }
     #tsi-panel.tsi-collapsed .tsi-body { display: none; }
@@ -1497,12 +1511,9 @@
     #tsi-panel .tsi-title-short { display: none; }
     #tsi-panel.tsi-collapsed .tsi-title-full { display: none; }
     #tsi-panel.tsi-collapsed .tsi-title-short { display: inline; }
-    /* Narrow screens (PDA / mobile). Collapsed: a compact pill on the right so
-       it doesn't cover the flight timer. Expanded: docks full width above the
-       bottom tab bar. The clearance (64px) clears PDA's tab row plus safe area;
-       raise it if your tab bar is taller. */
+    /* Narrow screens (PDA / mobile) in floating mode only. */
     @media (max-width: 784px) {
-      #tsi-panel {
+      #tsi-panel:not(.tsi-inline) {
         top: auto;
         bottom: calc(64px + env(safe-area-inset-bottom, 0px));
         right: 6px;
@@ -1512,42 +1523,39 @@
         max-height: 50vh;
         border-radius: 6px;
       }
-      /* Expanded on narrow: span the full width and round only the top. */
-      #tsi-panel:not(.tsi-collapsed) {
+      #tsi-panel:not(.tsi-inline):not(.tsi-collapsed) {
         right: 0;
         left: 0;
         width: 100%;
         max-width: 100%;
         border-radius: 6px 6px 0 0;
       }
-      /* Collapsed pill: tighten the header so it reads as a small button. */
-      #tsi-panel.tsi-collapsed h3 {
+      #tsi-panel:not(.tsi-inline).tsi-collapsed h3 {
         padding: 8px 12px;
         font-size: 13px;
       }
-      #tsi-panel.tsi-collapsed h3 > span:first-child {
+      #tsi-panel:not(.tsi-inline).tsi-collapsed h3 > span:first-child {
         margin-right: 6px;
       }
-      /* Short title only in the collapsed pill; gear is useless there. */
-      #tsi-panel.tsi-collapsed .tsi-gear-wrap,
-      #tsi-panel.tsi-collapsed #tsi-gear { display: none; }
+      #tsi-panel:not(.tsi-inline).tsi-collapsed .tsi-gear-wrap,
+      #tsi-panel:not(.tsi-inline).tsi-collapsed #tsi-gear { display: none; }
     }
     #tsi-panel h3 {
       margin: 0;
       padding: 8px 10px;
       background: #2a2a2a;
       border-bottom: 1px solid #444;
-      /* Indicates draggable on desktop. On PDA the cursor is irrelevant but
-         touch-action prevents the browser from scroll-stealing the gesture. */
-      cursor: move;
-      touch-action: none;
+      cursor: pointer;
       display: flex;
       justify-content: space-between;
       align-items: center;
       user-select: none;
     }
-    /* While dragging, drop the box shadow into something punchier so the
-       user gets clear feedback that the panel is following their pointer. */
+    /* Drag cursor / touch-action only in floating mode */
+    #tsi-panel:not(.tsi-inline) h3 {
+      cursor: move;
+      touch-action: none;
+    }
     #tsi-panel.tsi-dragging {
       box-shadow: 0 4px 20px rgba(90,160,240,0.4);
       opacity: 0.95;
@@ -1780,81 +1788,89 @@
         </table>
       </div>
     `;
-    document.body.appendChild(panel);
+    // Inject inline below the inventory grid when possible, fall back to
+    // floating fixed position. The aria-label selector is stable across Torn
+    // CSS module hash changes, making it the safest anchor available.
+    const inventoryEl = document.querySelector('ul[aria-label^="Inventory"]');
+    const isInline = !!inventoryEl;
 
-    // Collapse by tapping the header (better touch target than a small button).
-    // Default to collapsed on page open so the panel doesn't cover other UI;
-    // tap the header to expand when you want to see itineraries.
+    if (isInline) {
+      panel.classList.add('tsi-inline');
+      inventoryEl.after(panel);
+    } else {
+      document.body.appendChild(panel);
+    }
+
+    // Collapse behaviour differs between modes:
+    // - Inline: start expanded (it's below the inventory, not blocking anything)
+    // - Floating: start collapsed (avoids covering the page on load)
     const isNarrow = window.matchMedia('(max-width: 784px)').matches;
-    panel.classList.add('tsi-collapsed');
-    // Settings start open on desktop (room to spare), closed on narrow so the
-    // results table is the default view. The gear toggles either way.
-    if (!isNarrow) {
+    if (!isInline) {
+      panel.classList.add('tsi-collapsed');
+    }
+    // Settings start open on desktop floating mode, closed otherwise.
+    if (!isInline && !isNarrow) {
       document.getElementById('tsi-settings').classList.remove('tsi-settings-hidden');
     }
 
-    // Apply any saved custom position before wiring drag handlers.
-    if (panelPosition) applyPanelPosition(panel, panelPosition);
+    // Apply saved custom position only in floating mode.
+    if (!isInline && panelPosition) applyPanelPosition(panel, panelPosition);
 
-    // Header doubles as click target (collapse toggle) and drag handle.
-    // Distinguish tap from drag by movement distance: under 5px counts as a
-    // click, anything more is a drag. PointerEvents cover mouse and touch
-    // uniformly so this works on both desktop and PDA.
     const header = panel.querySelector('h3');
-    const DRAG_THRESHOLD_PX = 5;
-    let dragState = null;
 
-    header.addEventListener('pointerdown', (e) => {
-      // Ignore clicks on buttons inside the header (collapse arrow, gear).
-      if (e.target.closest('button')) return;
-      const rect = panel.getBoundingClientRect();
-      dragState = {
-        startX: e.clientX,
-        startY: e.clientY,
-        panelStartLeft: rect.left,
-        panelStartTop: rect.top,
-        moved: false,
-        pointerId: e.pointerId,
-      };
-      // Capture so we keep receiving move/up even if the pointer leaves the
-      // header. Without this, fast drags lose tracking.
-      try { header.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
-    });
+    // Drag is only wired in floating mode. In inline mode the header is a
+    // plain collapse toggle — no drag logic needed.
+    if (!isInline) {
+      const DRAG_THRESHOLD_PX = 5;
+      let dragState = null;
 
-    header.addEventListener('pointermove', (e) => {
-      if (!dragState || e.pointerId !== dragState.pointerId) return;
-      const dx = e.clientX - dragState.startX;
-      const dy = e.clientY - dragState.startY;
-      if (!dragState.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
-      dragState.moved = true;
-      panel.classList.add('tsi-dragging');
-      // Apply position live so the drag feels real-time.
-      applyPanelPosition(panel, {
-        left: dragState.panelStartLeft + dx,
-        top: dragState.panelStartTop + dy,
+      header.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('button')) return;
+        const rect = panel.getBoundingClientRect();
+        dragState = {
+          startX: e.clientX, startY: e.clientY,
+          panelStartLeft: rect.left, panelStartTop: rect.top,
+          moved: false, pointerId: e.pointerId,
+        };
+        try { header.setPointerCapture(e.pointerId); } catch { /* ignore */ }
       });
-      // Block touch scrolling under the header while dragging.
-      e.preventDefault();
-    });
 
-    function endDrag(e) {
-      if (!dragState || e.pointerId !== dragState.pointerId) return;
-      const wasDrag = dragState.moved;
-      const finalRect = panel.getBoundingClientRect();
-      try { header.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
-      dragState = null;
-      panel.classList.remove('tsi-dragging');
+      header.addEventListener('pointermove', (e) => {
+        if (!dragState || e.pointerId !== dragState.pointerId) return;
+        const dx = e.clientX - dragState.startX;
+        const dy = e.clientY - dragState.startY;
+        if (!dragState.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
+        dragState.moved = true;
+        panel.classList.add('tsi-dragging');
+        applyPanelPosition(panel, {
+          left: dragState.panelStartLeft + dx,
+          top: dragState.panelStartTop + dy,
+        });
+        e.preventDefault();
+      });
 
-      if (wasDrag) {
-        // Save the dropped position.
-        savePanelPosition({ left: finalRect.left, top: finalRect.top });
-      } else {
-        // Tap, not drag: toggle collapse like the old click handler did.
-        toggleCollapse();
+      function endDrag(e) {
+        if (!dragState || e.pointerId !== dragState.pointerId) return;
+        const wasDrag = dragState.moved;
+        const finalRect = panel.getBoundingClientRect();
+        try { header.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+        dragState = null;
+        panel.classList.remove('tsi-dragging');
+        if (wasDrag) {
+          savePanelPosition({ left: finalRect.left, top: finalRect.top });
+        } else {
+          toggleCollapse();
+        }
       }
+      header.addEventListener('pointerup', endDrag);
+      header.addEventListener('pointercancel', endDrag);
+    } else {
+      // Inline mode: plain click on header toggles collapse.
+      header.addEventListener('click', (e) => {
+        if (e.target.closest('button')) return;
+        toggleCollapse();
+      });
     }
-    header.addEventListener('pointerup', endDrag);
-    header.addEventListener('pointercancel', endDrag);
 
     // Toggle helper used by both the header tap and the collapse button click.
     // Kept as a closure so it can be referenced from inside endDrag too.
