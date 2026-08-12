@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.10.3
+// @version      2.10.4
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -361,7 +361,7 @@
     if (!TORN_API_KEY) return;
     try {
       const data = await gmFetch(
-        'https://api.torn.com/user/?selections=money,travel,basic&key=' + TORN_API_KEY
+        'https://api.torn.com/user/?selections=money,travel,basic,profile&key=' + TORN_API_KEY
       );
       if (data.error) {
         console.warn('User fetch failed:', data.error.error);
@@ -371,13 +371,17 @@
       }
       userMoney = typeof data.money_onhand === 'number' ? data.money_onhand : null;
       travelState = deriveTravelState(data, Date.now());
-      // Faction check. Use Number() so a string "51896" matches the numeric constant.
-      // Log what we get so mismatches are easy to diagnose.
+      // Faction check. Number() handles string/number type mismatch from the API.
+      // If faction data is absent entirely (key tier doesn't expose it), treat as
+      // null (unverifiable) rather than false (denied) — only deny when we can
+      // confirm a specific non-matching faction ID.
       const factionId = data.faction?.faction_id != null
         ? Number(data.faction.faction_id)
         : null;
-      console.log('[TSI] faction check — got:', factionId, 'expected:', ALLOWED_FACTION_ID, 'raw faction:', data.faction);
-      userAuthorised = factionId === ALLOWED_FACTION_ID;
+      console.log('[TSI] faction check — got:', factionId, 'raw faction obj:', JSON.stringify(data.faction));
+      userAuthorised = factionId === null
+        ? null                           // can't verify — allow through
+        : factionId === ALLOWED_FACTION_ID;
     } catch (err) {
       console.warn('User fetch error:', err);
       userMoney = null;
