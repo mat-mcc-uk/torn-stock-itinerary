@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.10.8
+// @version      2.10.9
 // @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -177,6 +177,9 @@
   let stockData = {};       // countryCode -> [{ id, name, quantity, cost }]
   let userMoney = null;     // cash on hand, null = unknown (no permission/key)
   let userAuthorised = null; // null = not yet checked, true = in faction, false = not
+  // Country code waiting to be auto-selected on the travel agency page after
+  // the user taps a Go badge. Persisted so a page navigation doesn't lose it.
+  let pendingTravel = GM_getValue('tsi_pendingTravel', null);
   // Travel state derived from the Torn API. delayToTakeoffMin is how long until
   // you could next take off from Torn (get home + land). null = unknown.
   let travelState = { location: 'unknown', delayToTakeoffMin: 0, description: '' };
@@ -1618,7 +1621,8 @@
       font-size: 10px;
       cursor: help;
     }
-    #tsi-panel .tsi-v-go { background: #1e5631; color: #9fe8b0; }
+    #tsi-panel .tsi-v-go { background: #1e5631; color: #9fe8b0; cursor: pointer; }
+    #tsi-panel .tsi-v-go:hover { background: #2d7d47; }
     #tsi-panel .tsi-v-risky { background: #5e4b16; color: #f0d27a; }
     #tsi-panel .tsi-v-learning { background: #333; color: #999; }
     #tsi-panel .tsi-v-skip { background: #2a2a2a; color: #777; }
@@ -1652,6 +1656,66 @@
       #tsi-panel .tsi-verdict { font-size: 12px; padding: 2px 7px; }
     }
   `);
+
+  // Navigate to the travel agency and attempt to auto-click the destination
+  // country on the map. The map is React-rendered so we wait for it with an
+  // observer before trying to click.
+  function initiateTravel(countryCode) {
+    const country = COUNTRIES[countryCode];
+    if (!country) return;
+    pendingTravel = { code: countryCode, name: country.name };
+    GM_setValue('tsi_pendingTravel', pendingTravel);
+    window.location.href = '/travelagency.php';
+  }
+
+  function tryAutoSelectCountry() {
+    if (!pendingTravel) return;
+    const name = pendingTravel.name;
+    // Try selectors from broadest to narrowest. Torn's map markers don't have
+    // predictable class names (CSS modules hash them), so aria and title
+    // attributes are the most reliable stable targets.
+    const selectors = [
+      `[aria-label="${name}"]`,
+      `[aria-label*="${name}"]`,
+      `[title="${name}"]`,
+      `[data-country="${name}"]`,
+      `[data-destination="${name}"]`,
+      `img[alt="${name}"]`,
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el) {
+        el.click();
+        pendingTravel = null;
+        GM_setValue('tsi_pendingTravel', null);
+        return;
+      }
+    }
+    // Last resort: any interactive element whose text or label exactly matches.
+    for (const el of document.querySelectorAll('button, [role="button"], a')) {
+      if (
+        el.textContent.trim() === name ||
+        el.getAttribute('aria-label') === name
+      ) {
+        el.click();
+        pendingTravel = null;
+        GM_setValue('tsi_pendingTravel', null);
+        return;
+      }
+    }
+  }
+
+  // Called when we arrive at the travel agency page with a pending destination.
+  // Waits up to 8 seconds for the map to render before giving up.
+  function waitAndSelectCountry() {
+    if (!pendingTravel) return;
+    let attempts = 0;
+    const interval = setInterval(() => {
+      attempts++;
+      tryAutoSelectCountry();
+      if (!pendingTravel || attempts >= 16) clearInterval(interval);
+    }, 500);
+  }
 
   function buildPanel() {
     const panel = document.createElement('div');
@@ -1821,17 +1885,8 @@
       upgradeObs.observe(document.body, { childList: true, subtree: true });
     }
 
-    // Collapse behaviour differs between modes:
-    // - Inline: start expanded (it's below the inventory, not blocking anything)
-    // - Floating: start collapsed (avoids covering the page on load)
-    const isNarrow = window.matchMedia('(max-width: 784px)').matches;
-    if (!isInline) {
-      panel.classList.add('tsi-collapsed');
-    }
-    // Settings start open on desktop floating mode, closed otherwise.
-    if (!isInline && !isNarrow) {
-      document.getElementById('tsi-settings').classList.remove('tsi-settings-hidden');
-    }
+    // Always start collapsed — user opens when ready to look at itineraries.
+    panel.classList.add('tsi-collapsed');
 
     // Apply saved custom position only in floating mode.
     if (!isInline && panelPosition) applyPanelPosition(panel, panelPosition);
@@ -2078,6 +2133,18 @@
     // "Fetch live price" button inside the chart row. Delegation on the tbody
     // means the single listener survives every re-render.
     document.getElementById('tsi-tbody').addEventListener('click', async (e) => {
+      // Go badge: tap the verdict chip to travel to that country.
+      const goVerdict = e.target.closest('.tsi-v-go');
+      if (goVerdict) {
+        e.stopPropagation();
+        const row = goVerdict.closest('[data-key]');
+        if (row) {
+          const [code] = row.dataset.key.split(':');
+          initiateTravel(code);
+        }
+        return;
+      }
+
       // Live-price button: fetch the real Item Market price and re-render.
       const priceBtn = e.target.closest('.tsi-live-price-btn');
       if (priceBtn) {
@@ -2607,15 +2674,13 @@
 
   function init() {
     ensurePanel();
+    // If we navigated here with a pending travel destination, try to auto-click
+    // the country on the travel agency map.
+    if (pendingTravel) waitAndSelectCountry();
 
-    // Re-inject if Torn's SPA re-renders and wipes the panel, and tear it
-    // down when you leave the travel page. A single observer on body covers
-    // both browser and PDA without polling. Debounced so it doesn't fire
-    // on every micro-mutation while Torn's UI is animating.
     const startObserver = () => {
       const target = document.body || document.documentElement;
       if (!target) {
-        // Body not ready yet (can happen on PDA): retry shortly.
         setTimeout(startObserver, 200);
         return;
       }
@@ -2624,6 +2689,8 @@
         pending = null;
         if (onTravelPage()) {
           ensurePanel();
+          // SPA navigation back to the travel page with a pending destination.
+          if (pendingTravel) waitAndSelectCountry();
         } else {
           const stale = document.getElementById('tsi-panel');
           if (stale) stale.remove();
