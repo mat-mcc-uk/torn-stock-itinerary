@@ -28,7 +28,7 @@
   const TORN_API_KEY = GM_getValue('tornApiKey', '');
   // Only members of this faction see live data. Anyone else sees a locked panel.
   // Not a setting — hardcoded so it cannot be bypassed through the UI.
-  const ALLOWED_FACTION_ID = 51896;
+  const ALLOWED_FACTION_ID = 36457;
   const REFRESH_MS = 60 * 1000;
 
   // Items the user always wants surfaced regardless of profit ranking.
