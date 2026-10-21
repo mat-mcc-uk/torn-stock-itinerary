@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.10.9
-// @description  Tracks foreign stock via YATA and ranks travel itineraries by profit, with item watchlist support (e.g. Xanax)
+// @version      2.11.0
+// @description  Tracks foreign stock via YATA, ranks travel itineraries by profit, plans drug exports and full round trips for Travel 2.0
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
 // @supportURL   https://github.com/mat-mcc-uk/torn-stock-itinerary/issues
@@ -75,19 +75,39 @@
   };
 
   // Travel methods. timeMult applies to standard one-way time.
-  // capacityBonus is the +items granted by the method itself (airstrip/WLT/
-  // BCT all grant +10 and don't stack with each other). Standard grants none.
+  // slots is the base travel inventory size the method gives before any
+  // suitcase, job or faction perks. Traveling 2.0 Phase 2 raised Standard
+  // from 5 to 10; the other methods stayed at 15.
   // Source: Torn wiki. Airstrip 70% of standard, WLT 50%, BCT 30%.
   const TRAVEL_METHODS = {
-    standard: { name: 'Standard', timeMult: 1.00, capacityBonus: 0 },
-    airstrip: { name: 'Airstrip', timeMult: 0.70, capacityBonus: 10 },
-    wlt:      { name: 'WLT (private jet)', timeMult: 0.50, capacityBonus: 10 },
-    business: { name: 'Business Class', timeMult: 0.30, capacityBonus: 10 },
+    standard: { name: 'Standard', timeMult: 1.00, slots: 10 },
+    airstrip: { name: 'Airstrip', timeMult: 0.70, slots: 15 },
+    wlt:      { name: 'WLT (private jet)', timeMult: 0.50, slots: 15 },
+    business: { name: 'Business Class', timeMult: 0.30, slots: 15 },
   };
 
   // "Mailing Yourself Abroad" book: further 25% reduction, stacks on top
   // of the chosen method.
   const MAILING_BOOK_MULT = 0.75;
+
+  // ---------------------------------------------------------------------
+  // Export config (Traveling 2.0 Phase 3)
+  // ---------------------------------------------------------------------
+
+  // Foreign shops buy back only what they sell. Black market goods (drugs)
+  // sell back at the shop's current price; everything else at 75% of it.
+  const FOREIGN_RESALE_MULT = 0.75;
+  const BLACK_MARKET_TYPES = ['Drug'];
+
+  // Black market prices move through the day, so the script logs them and
+  // builds an hour-of-day profile per item and country. One sample per key
+  // at most every 30 minutes unless the price changes, kept for 7 days.
+  const BM_HISTORY_KEY = 'blackMarketHistory';
+  const BM_HISTORY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+  const BM_SAMPLE_GAP_MS = 30 * 60 * 1000;
+  // An hour bucket needs samples from this many separate days before the
+  // script trusts it over the current price.
+  const BM_MIN_DAYS_PER_HOUR = 2;
 
   // ---------------------------------------------------------------------
   // Restock prediction config
@@ -197,15 +217,31 @@
   // clicks "Fetch live price" on a chart row. Keyed by itemId.
   // Does not persist: refreshed each session, one API call per lookup.
   const livePriceCache = {};
-  // baseCapacity = suitcase/job/faction bonuses only, NOT the travel-method +10.
-  // The method's +10 is added on top at calc time so switching method is live.
-  let baseCapacity = GM_getValue('baseCapacity', 5);
+  // extraSlots = suitcase, job and faction perks on top of the method's base
+  // slots. Replaces the old baseCapacity setting, which bundled the old
+  // Standard base of 5 in with the perks. Migrate once: strip that 5 out and
+  // flag the user to re-check, since Phase 2 also cut each suitcase by 1.
+  let extraSlots = GM_getValue('extraSlots', null);
+  let capacityNeedsCheck = GM_getValue('capacityNeedsCheck', false);
+  if (extraSlots === null) {
+    const legacy = GM_getValue('baseCapacity', null);
+    extraSlots = typeof legacy === 'number' ? Math.max(0, legacy - 5) : 0;
+    GM_setValue('extraSlots', extraSlots);
+    if (typeof legacy === 'number' && legacy !== 5) {
+      capacityNeedsCheck = true;
+      GM_setValue('capacityNeedsCheck', true);
+    }
+  }
   let travelMethod = GM_getValue('travelMethod', 'standard');
+  if (!TRAVEL_METHODS[travelMethod]) travelMethod = 'standard';
   let mailingBook = GM_getValue('mailingBook', false);
+  // Which table the panel shows: 'stock' (buy abroad, sell in Torn),
+  // 'export' (buy in Torn, sell abroad) or 'roundtrip' (both legs).
+  let viewMode = GM_getValue('viewMode', 'stock');
 
-  // Effective items carried = base + method bonus.
+  // Effective items carried = method base slots + perks.
   function effectiveCapacity() {
-    return baseCapacity + TRAVEL_METHODS[travelMethod].capacityBonus;
+    return TRAVEL_METHODS[travelMethod].slots + extraSlots;
   }
 
   // Effective one-way minutes for a country under current method + book.
@@ -1148,12 +1184,17 @@
 
   // Builds a flat, ranked list of every (country, item) pair, with profit per
   // trip, profit per hour, and a fly-now verdict from restock prediction.
-  function rankItineraries(hist, now) {
+  // opts.cash overrides cash on hand (the round-trip planner passes the cash
+  // you'd hold after selling exports abroad). opts.onlyCountry limits the scan
+  // to one country. opts.ignoreWatchFilter skips the watchlist-only filter.
+  function rankItineraries(hist, now, opts = {}) {
     const rows = [];
+    const cash = opts.cash !== undefined ? opts.cash : userMoney;
 
     for (const [code, country] of Object.entries(COUNTRIES)) {
       // Country filter: when set to a specific code, skip all others.
       if (countryFilter !== 'all' && countryFilter !== code) continue;
+      if (opts.onlyCountry && opts.onlyCountry !== code) continue;
 
       const entry = stockData[code];
       if (!entry || !entry.stocks) continue;
@@ -1193,7 +1234,7 @@
         );
 
         // Watchlist filter: when on, only watched items pass.
-        if (watchlistFilter && !isWatched) continue;
+        if (watchlistFilter && !isWatched && !opts.ignoreWatchFilter) continue;
 
         // Capacity you'd fill if stock allowed it. The verdict's projection
         // of stock-on-arrival is the honest figure - if it says zero will be
@@ -1209,10 +1250,10 @@
         // Affordability: how many you can pay for with cash on hand. Only
         // applies when money is known and the item has a buy cost.
         let affordableUnits = stockCapacity;
-        if (affordFilter && userMoney !== null && stockItem.cost > 0) {
+        if (affordFilter && cash !== null && stockItem.cost > 0) {
           affordableUnits = Math.min(
             stockCapacity,
-            Math.floor(userMoney / stockItem.cost)
+            Math.floor(cash / stockItem.cost)
           );
           // Can't afford a single one: drop it.
           if (affordableUnits < 1) continue;
@@ -1228,7 +1269,7 @@
         // Flag when cash, not stock, is the limit, so the UI can show it.
         const cashLimited =
           affordFilter &&
-          userMoney !== null &&
+          cash !== null &&
           stockItem.cost > 0 &&
           affordableUnits < stockCapacity;
 
@@ -1451,6 +1492,410 @@
     };
   }
 
+  // ---------------------------------------------------------------------
+  // Export and round-trip planning (Traveling 2.0 Phase 3)
+  // ---------------------------------------------------------------------
+  //
+  // Phase 3 lets you carry drugs abroad and sell them to the foreign black
+  // market at its current price. Foreign shops only buy what they sell, so an
+  // export works when a country lists the drug and its shelf price beats what
+  // you pay on the Item Market in Torn. YATA already reports every foreign
+  // shelf price, so the outbound sale value is the YATA cost for that item.
+  // Non-drug items sell back at 75% of the shelf price.
+
+  let bmHistoryCache = null;
+
+  function loadBMHistory() {
+    if (bmHistoryCache) return bmHistoryCache;
+    try {
+      bmHistoryCache = JSON.parse(GM_getValue(BM_HISTORY_KEY, '{}')) || {};
+    } catch {
+      bmHistoryCache = {};
+    }
+    return bmHistoryCache;
+  }
+
+  function saveBMHistory() {
+    GM_setValue(BM_HISTORY_KEY, JSON.stringify(bmHistoryCache || {}));
+  }
+
+  // True when Torn's item list types this item as a black market good.
+  function isBlackMarket(itemId) {
+    const info = itemPrices[itemId];
+    return !!(info && BLACK_MARKET_TYPES.includes(info.type));
+  }
+
+  // Log black market shelf prices from the latest YATA export. Needs item
+  // types from the Torn API, so it skips until the item list has loaded.
+  function recordBlackMarketPrices(now) {
+    if (Object.keys(itemPrices).length === 0) return;
+    const hist = loadBMHistory();
+    const cutoff = now - BM_HISTORY_WINDOW_MS;
+    let changed = false;
+
+    for (const [code, entry] of Object.entries(stockData)) {
+      if (!COUNTRIES[code] || !entry || !Array.isArray(entry.stocks)) continue;
+      // YATA stamps each country with its own update time in seconds.
+      const ts = typeof entry.update === 'number' ? entry.update * 1000 : now;
+      for (const s of entry.stocks) {
+        if (!isBlackMarket(s.id) || !(s.cost > 0)) continue;
+        const key = code + ':' + s.id;
+        const series = hist[key] || (hist[key] = []);
+        const last = series[series.length - 1];
+        if (last) {
+          if (ts <= last[0]) continue;                 // same YATA reading
+          if (last[1] === s.cost && ts - last[0] < BM_SAMPLE_GAP_MS) continue;
+        }
+        series.push([ts, s.cost]);
+        changed = true;
+      }
+    }
+
+    for (const key of Object.keys(hist)) {
+      const kept = hist[key].filter((p) => p[0] >= cutoff);
+      if (kept.length !== hist[key].length) changed = true;
+      if (kept.length) hist[key] = kept;
+      else delete hist[key];
+    }
+    if (changed) saveBMHistory();
+  }
+
+  // Average shelf price per Torn hour (UTC). An hour only counts once it has
+  // samples from BM_MIN_DAYS_PER_HOUR separate days, so one odd afternoon
+  // can't pose as a daily pattern. best = the highest-paying trusted hour.
+  function priceProfile(key) {
+    const series = loadBMHistory()[key];
+    if (!series || series.length < 2) return null;
+    const buckets = Array.from({ length: 24 }, () => ({ sum: 0, n: 0, days: new Set() }));
+    for (const [ts, price] of series) {
+      const d = new Date(ts);
+      const b = buckets[d.getUTCHours()];
+      b.sum += price;
+      b.n++;
+      b.days.add(d.toISOString().slice(0, 10));
+    }
+    const byHour = buckets.map((b) =>
+      b.days.size >= BM_MIN_DAYS_PER_HOUR ? b.sum / b.n : null
+    );
+    let best = null;
+    byHour.forEach((v, h) => {
+      if (v !== null && (best === null || v > best.price)) best = { hour: h, price: v };
+    });
+    return { byHour, best };
+  }
+
+  // What you'd pay per unit in Torn. Uses a live Item Market average when
+  // you've fetched one, otherwise market_value.
+  function tornBuyPrice(itemId) {
+    if (livePriceCache[itemId]) return livePriceCache[itemId];
+    const info = itemPrices[itemId];
+    return info && info.market_value > 0 ? info.market_value : null;
+  }
+
+  // "14:00 TCT" label for a UTC hour.
+  function fmtTornHour(h) {
+    return String(h).padStart(2, '0') + ':00 TCT';
+  }
+
+  // Every profitable export: buy in Torn, fly out, sell to the foreign shop.
+  // Selling has no stock limit for drugs, so the load is your full capacity,
+  // trimmed by cash when the affordability filter is on.
+  function rankExports(now) {
+    const rows = [];
+    const cap = effectiveCapacity();
+    const takeoffDelay = travelState.delayToTakeoffMin || 0;
+
+    for (const [code, country] of Object.entries(COUNTRIES)) {
+      if (countryFilter !== 'all' && countryFilter !== code) continue;
+      const entry = stockData[code];
+      if (!entry || !Array.isArray(entry.stocks)) continue;
+
+      const oneWayMin = effectiveOneWay(code);
+      const roundTripMin = oneWayMin * 2;
+      const landMs = now + (takeoffDelay + oneWayMin) * 60000;
+      const landHour = new Date(landMs).getUTCHours();
+
+      for (const s of entry.stocks) {
+        if (!(s.cost > 0)) continue;
+        const buy = tornBuyPrice(s.id);
+        if (buy === null) continue;
+
+        const blackMarket = isBlackMarket(s.id);
+        const sellNow = blackMarket ? s.cost : s.cost * FOREIGN_RESALE_MULT;
+        let sellAtLanding = sellNow;
+        let profile = null;
+        if (blackMarket) {
+          profile = priceProfile(code + ':' + s.id);
+          const hourly = profile ? profile.byHour[landHour] : null;
+          if (hourly) sellAtLanding = hourly;
+        }
+
+        const margin = sellAtLanding - buy;
+        if (margin <= 0) continue;
+
+        let units = cap;
+        if (affordFilter && userMoney !== null) {
+          units = Math.min(cap, Math.floor(userMoney / buy));
+        }
+        if (units < 1) continue;
+
+        const isWatched = watchlist.some(
+          (w) => w.toLowerCase() === String(s.name).toLowerCase()
+        );
+        if (watchlistFilter && !isWatched) continue;
+
+        const profitPerTrip = margin * units;
+        rows.push({
+          country: country.name,
+          countryCode: code,
+          item: s.name,
+          itemId: s.id,
+          blackMarket,
+          buy,
+          sellNow,
+          sellAtLanding,
+          landHour,
+          profile,
+          margin,
+          units,
+          cashLimited: units < cap,
+          outlay: buy * units,
+          profitPerTrip,
+          profitPerHour: profitPerTrip / (roundTripMin / 60),
+          roundTripMin,
+          isWatched,
+        });
+      }
+    }
+
+    const field = profitMode === 'trip' ? 'profitPerTrip' : 'profitPerHour';
+    rows.sort((a, b) => b[field] - a[field]);
+    return rows;
+  }
+
+  // One row per destination: the best export on the way out plus the best
+  // foreign stock buy on the way back. Slots free up once you sell the
+  // exports, so both legs use your full capacity. The return buy gets the
+  // cash you'd hold after the export sale.
+  function rankRoundTrips(hist, now) {
+    const exportsByCountry = {};
+    for (const e of rankExports(now)) {
+      // rankExports sorts best first and round-trip time is per country, so
+      // the first row per country is that country's best export either way.
+      if (!exportsByCountry[e.countryCode]) exportsByCountry[e.countryCode] = e;
+    }
+
+    const rows = [];
+    for (const [code, country] of Object.entries(COUNTRIES)) {
+      if (countryFilter !== 'all' && countryFilter !== code) continue;
+      if (!stockData[code]) continue;
+
+      const out = exportsByCountry[code] || null;
+      const cashAbroad = userMoney === null
+        ? null
+        : userMoney + (out ? out.units * (out.sellAtLanding - out.buy) : 0);
+
+      const inRows = rankItineraries(hist, now, {
+        cash: cashAbroad,
+        onlyCountry: code,
+        ignoreWatchFilter: true,
+      }).filter(
+        (r) =>
+          (r.verdict.code === 'go' || r.verdict.code === 'risky') &&
+          r.profitPerTrip !== null &&
+          r.profitPerTrip > 0
+      );
+      let back = null;
+      for (const r of inRows) {
+        if (!back || r.profitPerTrip > back.profitPerTrip) back = r;
+      }
+
+      const outProfit = out ? out.profitPerTrip : 0;
+      const backProfit = back ? back.profitPerTrip : 0;
+      const total = outProfit + backProfit;
+      if (total <= 0) continue;
+
+      const roundTripMin = effectiveOneWay(code) * 2;
+      let verdict;
+      if (back) {
+        verdict = back.verdict;
+      } else {
+        verdict = {
+          code: 'go',
+          label: 'Go',
+          reason: 'Export only. Nothing worth buying for the flight home',
+        };
+      }
+
+      rows.push({
+        country: country.name,
+        countryCode: code,
+        out,
+        back,
+        outProfit,
+        backProfit,
+        profitPerTrip: total,
+        profitPerHour: total / (roundTripMin / 60),
+        roundTripMin,
+        verdict,
+      });
+    }
+
+    const order = { go: 0, risky: 1, learning: 2, skip: 3 };
+    const field = profitMode === 'trip' ? 'profitPerTrip' : 'profitPerHour';
+    rows.sort((a, b) => {
+      const oa = order[a.verdict.code] ?? 5;
+      const ob = order[b.verdict.code] ?? 5;
+      if (oa !== ob) return oa - ob;
+      return b[field] - a[field];
+    });
+    return rows;
+  }
+
+  // Table header markup per view. The stock header keeps its original ids.
+  const VIEW_HEADS = {
+    stock: `<tr>
+        <th>Fly?</th><th>Item</th><th>Stock</th><th id="tsi-profit-head">$/hr</th>
+        <th class="tsi-col-extra">Country</th>
+        <th class="tsi-col-extra">Restock</th>
+        <th class="tsi-col-extra">RT</th>
+      </tr>`,
+    export: `<tr>
+        <th>Fly?</th><th>Export</th><th>Margin</th><th class="tsi-profit-label">$/hr</th>
+        <th class="tsi-col-extra">Torn buy</th>
+        <th class="tsi-col-extra">Sells abroad</th>
+        <th class="tsi-col-extra">RT</th>
+      </tr>`,
+    roundtrip: `<tr>
+        <th>Fly?</th><th>Destination</th><th>Out / back</th><th class="tsi-profit-label">$/hr</th>
+        <th class="tsi-col-extra">Out $</th>
+        <th class="tsi-col-extra">Back $</th>
+        <th class="tsi-col-extra">RT</th>
+      </tr>`,
+  };
+
+  function setViewHead(view) {
+    const thead = document.getElementById('tsi-thead');
+    if (!thead || thead.dataset.view === view) return;
+    thead.innerHTML = VIEW_HEADS[view];
+    thead.dataset.view = view;
+    dom.profitHead = document.getElementById('tsi-profit-head');
+  }
+
+  // Highlight the active view tab.
+  function syncViewTabs() {
+    document.querySelectorAll('#tsi-views button').forEach((b) => {
+      b.classList.toggle('tsi-view-active', b.dataset.view === viewMode);
+    });
+  }
+
+  // Sell price cell: price now, plus the landing-hour average when the
+  // profile has learned that hour and it differs from now.
+  function exportPriceCell(e) {
+    let html = formatMoney(e.sellNow);
+    if (!e.blackMarket) {
+      html += ' <span style="color:#888">(75%)</span>';
+    } else if (e.sellAtLanding !== e.sellNow) {
+      const cls = e.sellAtLanding > e.sellNow ? 'tsi-profit-pos' : 'tsi-profit-neg';
+      html += ` <span class="${cls}" title="Average at ${fmtTornHour(e.landHour)}, your landing hour">→ ${formatMoney(e.sellAtLanding)}</span>`;
+    }
+    return html;
+  }
+
+  function exportReason(e) {
+    let reason = `Buy ${e.units} in Torn at ~${formatMoney(e.buy)} (${formatMoney(e.outlay)}), sell at ~${formatMoney(e.sellAtLanding)} each`;
+    if (e.cashLimited) reason += '. Cash limits the load';
+    if (e.profile && e.profile.best) {
+      reason += `. Best hour so far: ${fmtTornHour(e.profile.best.hour)} at ~${formatMoney(e.profile.best.price)}`;
+    } else if (e.blackMarket) {
+      reason += '. Still learning this price\'s daily pattern';
+    }
+    return reason;
+  }
+
+  // Renders the export or round-trip view into the shared table and fills
+  // the best-pick banner. Rows use tsi-alt-row so they don't open charts.
+  function renderAltView(hist, now, tbody) {
+    setViewHead(viewMode);
+    document.querySelectorAll('#tsi-thead .tsi-profit-label').forEach((th) => {
+      th.textContent = profitMode === 'trip' ? '$/trip' : '$/hr';
+    });
+    const pickField = profitMode === 'trip' ? 'profitPerTrip' : 'profitPerHour';
+    const pickUnit = profitMode === 'trip' ? '/trip' : '/hr';
+
+    if (viewMode === 'export') {
+      const rows = rankExports(now);
+      tbody.innerHTML = rows.length
+        ? rows.slice(0, 50).map((e) => {
+            const verdict = { code: 'go', label: 'Go', reason: exportReason(e) };
+            return `
+              <tr class="tsi-alt-row ${e.isWatched ? 'tsi-watched' : ''}" data-key="${e.countryCode}:x${e.itemId}">
+                <td>${verdictCell(verdict)}</td>
+                <td><span class="tsi-ccode">${e.countryCode.toUpperCase()}</span> ${escapeHTML(e.item)} ×${e.units}${e.isWatched ? ' ★' : ''}</td>
+                <td class="tsi-profit-pos" title="${escapeHTML(exportReason(e))}">${formatMoney(e.margin)}</td>
+                <td class="tsi-profit-pos">${formatMoney(e[pickField])}</td>
+                <td class="tsi-col-extra">${formatMoney(e.buy)}${livePriceCache[e.itemId] ? '' : ' <span style="color:#888">(mv)</span>'}</td>
+                <td class="tsi-col-extra">${exportPriceCell(e)}</td>
+                <td class="tsi-col-extra">${formatTime(e.roundTripMin)}</td>
+              </tr>`;
+          }).join('')
+        : `<tr><td colspan="7" style="color:#888">${
+            Object.keys(itemPrices).length
+              ? 'No profitable exports right now with your settings.'
+              : 'Add a Torn API key to price exports.'
+          }</td></tr>`;
+
+      if (dom.bestpick) {
+        if (rows.length) {
+          const p = rows[0];
+          dom.bestpick.style.display = 'block';
+          dom.bestpick.innerHTML = `<strong>Export now:</strong> ${p.units}× ${escapeHTML(p.item)} to ${escapeHTML(p.country)}, ${formatMoney(p[pickField])}${pickUnit}. ${escapeHTML(exportReason(p))}`;
+        } else {
+          dom.bestpick.style.display = 'none';
+        }
+      }
+      return;
+    }
+
+    // Round-trip view.
+    const rows = rankRoundTrips(hist, now);
+    const legText = (leg, units) =>
+      leg ? `${units}× ${escapeHTML(leg.item)}` : '<span style="color:#888">nothing</span>';
+    tbody.innerHTML = rows.length
+      ? rows.slice(0, 50).map((r) => {
+          const outText = legText(r.out, r.out ? r.out.units : 0);
+          const backText = legText(r.back, r.back ? r.back.itemsAvailable : 0);
+          const reason = [
+            r.out ? `Out: ${exportReason(r.out)}` : 'Out: no profitable export',
+            r.back ? `Back: ${r.back.verdict.reason}` : 'Back: nothing worth buying',
+          ].join('. ');
+          const verdict = { ...r.verdict, reason };
+          return `
+            <tr class="tsi-alt-row" data-key="${r.countryCode}:rt">
+              <td>${verdictCell(verdict)}</td>
+              <td><span class="tsi-ccode">${r.countryCode.toUpperCase()}</span> ${escapeHTML(r.country)}</td>
+              <td>${outText} / ${backText}</td>
+              <td class="tsi-profit-pos">${formatMoney(r[pickField])}</td>
+              <td class="tsi-col-extra">${formatMoney(r.outProfit)}</td>
+              <td class="tsi-col-extra">${formatMoney(r.backProfit)}</td>
+              <td class="tsi-col-extra">${formatTime(r.roundTripMin)}</td>
+            </tr>`;
+        }).join('')
+      : `<tr><td colspan="7" style="color:#888">No profitable round trips right now with your settings.</td></tr>`;
+
+    if (dom.bestpick) {
+      const best = rows.find((r) => r.verdict.code === 'go');
+      if (best) {
+        dom.bestpick.style.display = 'block';
+        const outBit = best.out ? `${best.out.units}× ${escapeHTML(best.out.item)} out` : 'fly out empty';
+        const backBit = best.back ? `${best.back.itemsAvailable}× ${escapeHTML(best.back.item)} back` : 'fly back empty';
+        dom.bestpick.innerHTML = `<strong>Best round trip:</strong> ${escapeHTML(best.country)}. ${outBit}, ${backBit}. ${formatMoney(best[pickField])}${pickUnit}`;
+      } else {
+        dom.bestpick.style.display = 'none';
+      }
+    }
+  }
+
   // hh:mm local clock for a timestamp.
   function fmtClock(tsMs) {
     return new Date(tsMs).toLocaleTimeString([], {
@@ -1640,6 +2085,13 @@
     #tsi-panel .tsi-settings.tsi-settings-hidden { display: none; }
     #tsi-panel .tsi-settings > div { margin: 4px 0; }
     #tsi-panel #tsi-glance { font-size: 11px; margin-bottom: 4px; }
+    #tsi-panel #tsi-views { display: flex; gap: 4px; margin: 4px 0 6px; }
+    #tsi-panel #tsi-views button { flex: 1; }
+    #tsi-panel #tsi-views button.tsi-view-active {
+      background: #1e3a5c;
+      border-color: #5a8fd0;
+      color: #cfe2ff;
+    }
     /* Narrow screens (PDA): drop secondary columns, enlarge touch targets,
        and let settings controls fill the width so they stop cramming. */
     @media (max-width: 784px) {
@@ -1809,12 +2261,20 @@
             </label>
           </div>
           <div>
-            Base capacity:
-            <input id="tsi-capacity" type="number" min="1" max="44" style="width:50px"
-                   value="${baseCapacity}">
+            Extra slots:
+            <input id="tsi-capacity" type="number" min="0" max="40" style="width:50px"
+                   value="${extraSlots}">
             <span id="tsi-effcap" style="color:#888"></span>
             <button id="tsi-save-capacity">Save</button>
             <button id="tsi-refresh">Refresh now</button>
+            <div style="color:#888;font-size:10px">
+              Suitcase, job and faction perks only. Suitcases now give 1/2/3.
+              Check the total against the slot count in your travel inventory.
+            </div>
+            <div id="tsi-capcheck" style="color:#f0d27a;font-size:10px;${capacityNeedsCheck ? '' : 'display:none'}">
+              Capacity rules changed in Travel 2.0. Your old setting was converted
+              to ${extraSlots} extra slots. Re-check it and press Save.
+            </div>
           </div>
           <div>
             <span id="tsi-calibration-status" style="color:#888;font-size:10px"></span>
@@ -1839,14 +2299,14 @@
           </div>
         </div>
 
+        <div id="tsi-views">
+          <button data-view="stock" title="Buy abroad, sell in Torn">Stock</button>
+          <button data-view="export" title="Buy in Torn, sell abroad">Export</button>
+          <button data-view="roundtrip" title="Export out, stock back">Round trip</button>
+        </div>
         <table id="tsi-table">
-          <thead>
-            <tr>
-              <th>Fly?</th><th>Item</th><th>Stock</th><th id="tsi-profit-head">$/hr</th>
-              <th class="tsi-col-extra">Country</th>
-              <th class="tsi-col-extra">Restock</th>
-              <th class="tsi-col-extra">RT</th>
-            </tr>
+          <thead id="tsi-thead" data-view="stock">
+            ${VIEW_HEADS.stock}
           </thead>
           <tbody id="tsi-tbody"></tbody>
         </table>
@@ -2043,9 +2503,13 @@
 
     document.getElementById('tsi-save-capacity').addEventListener('click', () => {
       const val = parseInt(document.getElementById('tsi-capacity').value, 10);
-      if (val > 0) {
-        baseCapacity = val;
-        GM_setValue('baseCapacity', baseCapacity);
+      if (val >= 0) {
+        extraSlots = val;
+        GM_setValue('extraSlots', extraSlots);
+        capacityNeedsCheck = false;
+        GM_setValue('capacityNeedsCheck', false);
+        const note = document.getElementById('tsi-capcheck');
+        if (note) note.style.display = 'none';
         renderTable();
       }
     });
@@ -2097,6 +2561,16 @@
 
     document.getElementById('tsi-refresh').addEventListener('click', refreshAll);
 
+    // View tabs: switch between stock runs, exports and round trips.
+    document.getElementById('tsi-views').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-view]');
+      if (!btn) return;
+      e.stopPropagation();
+      viewMode = btn.dataset.view;
+      GM_setValue('viewMode', viewMode);
+      renderTable();
+    });
+
     document.getElementById('tsi-reset-data').addEventListener('click', () => {
       if (!confirm(
         'Clear all stock history and cached live prices? Predictions will need '
@@ -2107,6 +2581,8 @@
       historyCache = {};
       GM_setValue(CYCLE_HISTORY_KEY, '{}');
       cycleHistoryCache = {};
+      GM_setValue(BM_HISTORY_KEY, '{}');
+      bmHistoryCache = {};
       for (const k of Object.keys(livePriceCache)) delete livePriceCache[k];
       expandedCharts.clear();
       saveExpandedCharts();
@@ -2406,7 +2882,6 @@
   function renderTable(hist, now) {
     hist = hist || loadHistory();
     now = now || Date.now();
-    const rows = rankItineraries(hist, now);
 
     // Use cached DOM refs. If a ref is missing (panel rebuilt mid-session),
     // re-cache and try again. This avoids dozens of getElementById per render.
@@ -2416,6 +2891,20 @@
       tbody = dom.tbody;
     }
     if (!tbody) return;
+
+    syncViewTabs();
+    if (viewMode === 'export' || viewMode === 'roundtrip') {
+      renderAltView(hist, now, tbody);
+    } else {
+      renderStockView(hist, now, tbody);
+    }
+    renderPanelStatus(hist);
+  }
+
+  // The original stock view: buy abroad, sell in Torn.
+  function renderStockView(hist, now, tbody) {
+    setViewHead('stock');
+    const rows = rankItineraries(hist, now);
 
     // Swap the profit column header to match the chosen display mode.
     if (dom.profitHead) {
@@ -2509,7 +2998,10 @@
         dom.bestpick.style.display = 'none';
       }
     }
+  }
 
+  // Shared header bits: capacity, calibration, cash, location, status line.
+  function renderPanelStatus(hist) {
     if (dom.effcap) {
       dom.effcap.textContent = `(carrying ${effectiveCapacity()} with ${
         TRAVEL_METHODS[travelMethod].name
@@ -2618,6 +3110,9 @@
     // Always record a snapshot so collapsed-panel users still build history.
     // Previously, collapsing the panel halted data collection.
     const hist = recordSnapshot(now);
+    // Log black market prices on every refresh too, collapsed or not, so the
+    // export view's hour-of-day profile keeps learning in the background.
+    recordBlackMarketPrices(now);
 
     // Skip the heavy render work when the panel is collapsed.
     if (panel.classList.contains('tsi-collapsed')) return;
