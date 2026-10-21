@@ -88,7 +88,7 @@ Two constants near the top of the script tune the model once you've watched real
 - Restock timing is a heuristic, not a documented game mechanic. Treat verdicts as a strong hint, not a guarantee.
 - Flight times carry a 3% in-game variance, so round-trip figures are close but not exact.
 - The location timing is a snapshot refreshed every 60 seconds, so a mid-flight countdown can be up to a minute stale.
-- Export buy prices use Torn's `market_value` unless you fetch a live Item Market average from the Stock tab's chart row. Buying a full load can push the real price above that figure.
+- Export buy prices come from live Item Market listings: the cost of buying your whole load, cheapest first, refreshed every 5 minutes while the Export or Round trip tab is open. Until an item's listings load, its row shows a grey estimate from `market_value` and never gets a Go.
 - Torn hasn't said whether selling drugs abroad lowers the shelf price. If the price drops as people sell, late sellers earn less than the table shows.
 
 ## Credits
