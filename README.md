@@ -10,6 +10,8 @@ A userscript for [Torn](https://www.torn.com) that tracks foreign stock and tell
 - Filters out trips you can't afford based on your cash on hand
 - Filters by watchlist (hunt one item like Xanax across all countries) or by a single country
 - Shows a per-item stock history chart on click, with the predicted restock marked
+- Plans drug exports under Travel 2.0: what to buy in Torn and which country's black market pays most for it
+- Plans full round trips: the best export on the way out plus the best stock buy on the way home, using the cash you'd hold after the sale
 
 ## Install
 
@@ -45,13 +47,21 @@ Paste the key into the panel's API key field and click Save. The field masks the
 The panel has a few controls:
 
 - **Travel method:** pick Standard, Airstrip, WLT, or Business Class so flight times and capacity match your setup. Tick the mailing book box if you have it.
-- **Base capacity:** your standard carry count from suitcases, job, and faction perks, before the travel method's +10.
+- **Extra slots:** slots from suitcases, job, and faction perks only. The script adds the method's base itself (Standard 10, Airstrip/WLT/Business 15). Suitcases now give 1/2/3. Check the total against the slot count in your travel inventory.
 - **Watchlist:** comma-separated item names. Watched items get a star and sort to the top.
 - **Only watchlist:** show only watched items.
 - **Hide unaffordable:** drop trips your cash can't cover.
 - **Country:** narrow the table to one destination.
 
 Each row shows a verdict (Go / Wait / Risky / Learning), the country, item, current stock, restock estimate, round-trip time, and profit per hour. Click a row to open its stock history chart.
+
+Three tabs sit above the table:
+
+- **Stock:** the original view. Buy abroad, sell in Torn.
+- **Export:** buy in Torn, sell to a foreign shop. Foreign shops only buy what they sell. Drugs sell back at the shelf price, everything else at 75% of it. The sell column shows today's price and, once the script has learned it, the average for the hour you'd land.
+- **Round trip:** one row per country with the best export out and the best stock buy back. Slots free up after the export sale, so both legs use your full capacity.
+
+Black market prices move through the day. The script logs them every refresh and builds an hour-of-day average per drug and country over the last 7 days. An hour only counts once it has data from two separate days, so the landing-hour figure appears after a couple of days of running.
 
 ## The learning period
 
@@ -78,6 +88,8 @@ Two constants near the top of the script tune the model once you've watched real
 - Restock timing is a heuristic, not a documented game mechanic. Treat verdicts as a strong hint, not a guarantee.
 - Flight times carry a 3% in-game variance, so round-trip figures are close but not exact.
 - The location timing is a snapshot refreshed every 60 seconds, so a mid-flight countdown can be up to a minute stale.
+- Export buy prices use Torn's `market_value` unless you fetch a live Item Market average from the Stock tab's chart row. Buying a full load can push the real price above that figure.
+- Torn hasn't said whether selling drugs abroad lowers the shelf price. If the price drops as people sell, late sellers earn less than the table shows.
 
 ## Credits
 
