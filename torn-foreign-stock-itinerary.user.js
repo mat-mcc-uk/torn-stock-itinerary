@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.12.0
+// @version      2.12.1
 // @description  Tracks foreign stock via YATA, ranks travel itineraries by profit, plans drug exports and full round trips for Travel 2.0
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -2006,10 +2006,11 @@
     return html;
   }
 
-  // Short buy/pack hint under the item name, visible on mobile too.
-  function packCell(e) {
+  // Short buy/pack hint under the item name, visible on mobile too. The
+  // round-trip tab passes a prefix so it reads clearly under both legs.
+  function packCell(e, prefix = '') {
     if (e.priced !== 'live') {
-      return e.owned > 0 ? `<div style="font-size:10px;color:#888">you hold ${e.owned}</div>` : '';
+      return e.owned > 0 ? `<div style="font-size:10px;color:#888">${prefix}you hold ${e.owned}</div>` : '';
     }
     let text, color;
     if (e.useOwned > 0 && e.boughtUnits === 0) {
@@ -2022,7 +2023,7 @@
       text = `buy ${e.boughtUnits}`;
       color = '#f0d27a';
     }
-    return `<div style="font-size:10px;color:${color}">${text}</div>`;
+    return `<div style="font-size:10px;color:${color}">${prefix}${text}</div>`;
   }
 
   // Footer row for the export views: how fresh the inventory read is.
@@ -2145,7 +2146,7 @@
             <tr class="tsi-alt-row" data-key="${r.countryCode}:rt">
               <td>${verdictCell(verdict)}</td>
               <td><span class="tsi-ccode">${r.countryCode.toUpperCase()}</span> ${escapeHTML(r.country)}</td>
-              <td>${outText} / ${backText}</td>
+              <td>${outText} / ${backText}${r.out ? packCell(r.out, 'Before flying: ') : ''}</td>
               <td class="tsi-profit-pos">${formatMoney(r[pickField])}</td>
               <td class="tsi-col-extra">${formatMoney(r.outProfit)}</td>
               <td class="tsi-col-extra">${formatMoney(r.backProfit)}</td>
