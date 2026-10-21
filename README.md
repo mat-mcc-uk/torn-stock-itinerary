@@ -78,6 +78,8 @@ The script carries `@updateURL` and `@downloadURL` headers pointing at this repo
 
 The script fits a sell rate to the recent decline in each item's logged stock, estimates when it will empty, and projects the next restock as roughly half the last sell-out duration, snapped to Torn's quarter-hour tick. It then simulates the item's state at the moment your flight would land, including the time to fly home and launch if you're already abroad, and picks a verdict from that.
 
+Since Travel 2.0, players can sell items back to foreign shops, which raises stock outside normal restocks, and Torn clears that overstock at 00:00 TCT. The script strips these out before predicting. A rise only counts as a restock when the shelf was empty, a quarter-hour tick fell between the two YATA readings, and the rise is a reasonable fraction of the item's usual restock. Anything else is treated as a sell-back. Rows say how much of the current shelf came from sell-backs.
+
 Two constants near the top of the script tune the model once you've watched real cycles:
 
 - `RESTOCK_RATIO` (default 0.5): refill time as a fraction of sell-out time. Community estimates range from a third to a half.
@@ -87,6 +89,7 @@ Two constants near the top of the script tune the model once you've watched real
 
 - Stock data comes from YATA's public export. If YATA is down or an item is missing from the feed, that item won't show.
 - Restock timing is a heuristic, not a documented game mechanic. Treat verdicts as a strong hint, not a guarantee.
+- Profit figures subtract the Standard ticket (or a Business Class Ticket's market value). Airstrip and WLT fly free. The flight home costs nothing, so the ticket comes off once per round trip.
 - Flight times carry a 3% in-game variance, so round-trip figures are close but not exact.
 - The location timing is a snapshot refreshed every 60 seconds, so a mid-flight countdown can be up to a minute stale.
 - Export buy prices come from live Item Market listings: the cost of buying your whole load, cheapest first, refreshed every 5 minutes while the Export or Round trip tab is open. Until an item's listings load, its row shows a grey estimate from `market_value` and never gets a Go.

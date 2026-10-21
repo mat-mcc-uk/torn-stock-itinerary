@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.12.1
+// @version      2.13.0
 // @description  Tracks foreign stock via YATA, ranks travel itineraries by profit, plans drug exports and full round trips for Travel 2.0
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -37,18 +37,21 @@
 
   // One-way travel time in minutes, standard (no airstrip/business class).
   // Source: Torn wiki. Round trip = 2x for items requiring a return leg.
+  // ticket is the Standard fare, paid once when you leave Torn. The flight
+  // home is free. Airstrip and WLT fly free; Business Class uses a ticket
+  // item, priced from its market value. Fares from torntravel.com.
   const COUNTRIES = {
-    mex: { name: 'Mexico', oneWayMin: 20 },
-    cay: { name: 'Cayman Islands', oneWayMin: 57 },
-    can: { name: 'Canada', oneWayMin: 37 },
-    haw: { name: 'Hawaii', oneWayMin: 121 },
-    uni: { name: 'United Kingdom', oneWayMin: 152 },
-    arg: { name: 'Argentina', oneWayMin: 189 },
-    swi: { name: 'Switzerland', oneWayMin: 169 },
-    jap: { name: 'Japan', oneWayMin: 203 },
-    chi: { name: 'China', oneWayMin: 219 },
-    uae: { name: 'UAE', oneWayMin: 259 },
-    sou: { name: 'South Africa', oneWayMin: 311 },
+    mex: { name: 'Mexico', oneWayMin: 20, ticket: 2760 },
+    cay: { name: 'Cayman Islands', oneWayMin: 57, ticket: 3720 },
+    can: { name: 'Canada', oneWayMin: 37, ticket: 4360 },
+    haw: { name: 'Hawaii', oneWayMin: 121, ticket: 14250 },
+    uni: { name: 'United Kingdom', oneWayMin: 152, ticket: 16920 },
+    arg: { name: 'Argentina', oneWayMin: 189, ticket: 17770 },
+    swi: { name: 'Switzerland', oneWayMin: 169, ticket: 18620 },
+    jap: { name: 'Japan', oneWayMin: 203, ticket: 23930 },
+    chi: { name: 'China', oneWayMin: 219, ticket: 25740 },
+    uae: { name: 'UAE', oneWayMin: 259, ticket: 26700 },
+    sou: { name: 'South Africa', oneWayMin: 311, ticket: 31590 },
   };
 
   // Global flight-time reduction. Torn cut all flight times by 5.26% (the new
@@ -203,6 +206,14 @@
   const DOWNSAMPLE_AFTER_MS = 12 * 60 * 60 * 1000; // full detail for 12h
   const DOWNSAMPLE_GRID_MS = 5 * 60 * 1000;        // then one point per 5min
 
+  // Player sell-backs (Travel 2.0) raise foreign stock outside restocks, and
+  // Torn clears that overstock daily at 00:00 TCT. The predictor runs on
+  // "organic" stock with sell-backs stripped out. A rise only counts as a
+  // restock when the shelf was empty, a quarter-hour tick fell between the
+  // two YATA readings, and (once known) it's at least this fraction of the
+  // item's usual restock size.
+  const RESTOCK_MIN_FRACTION = 0.3;
+
   // ---------------------------------------------------------------------
   // State
   // ---------------------------------------------------------------------
@@ -256,6 +267,18 @@
   // Effective items carried = method base slots + perks.
   function effectiveCapacity() {
     return TRAVEL_METHODS[travelMethod].slots + extraSlots;
+  }
+
+  // What one round trip costs to fly under the current method.
+  function ticketCost(code) {
+    if (travelMethod === 'standard') return COUNTRIES[code] ? COUNTRIES[code].ticket : 0;
+    if (travelMethod === 'business') {
+      const bct = Object.values(itemPrices).find(
+        (i) => i && i.name === 'Business Class Ticket'
+      );
+      return bct && bct.market_value > 0 ? bct.market_value : 0;
+    }
+    return 0;
   }
 
   // Effective one-way minutes for a country under current method + book.
@@ -902,6 +925,10 @@
     for (const [code] of Object.entries(COUNTRIES)) {
       const entry = stockData[code];
       if (!entry || !entry.stocks) continue;
+      // YATA's own reading time for this country. Stored as a third field on
+      // each point so sell-back detection can tell whether a restock tick
+      // fell between two readings. Older points lack it.
+      const yataMs = yataUpdateMs(entry);
 
       for (const stockItem of entry.stocks) {
         const key = code + ':' + stockItem.id;
@@ -914,7 +941,7 @@
         if (last && last[1] === stockItem.quantity && now - last[0] < SNAPSHOT_DEDUPE_MS) {
           continue;
         }
-        series.push([now, stockItem.quantity]);
+        series.push(yataMs ? [now, stockItem.quantity, yataMs] : [now, stockItem.quantity]);
 
         // Trim to window.
         while (series.length && series[0][0] < cutoff) series.shift();
@@ -946,9 +973,10 @@
           }
         }
 
-        // Detect any completed empty->restock cycle and record it. Cheap
-        // because it only walks the tail since the last scan.
-        detectAndRecordCycle(key, hist[key], now);
+        // Detect any completed empty->restock cycle and record it. Runs on
+        // organic stock so a sell-back onto an empty shelf isn't logged as
+        // a restock.
+        detectAndRecordCycle(key, organicSeries(key, hist[key]), now);
       }
     }
 
@@ -957,6 +985,77 @@
     // touched. Replaces the old per-item save.
     flushCycleHistory();
     return hist;
+  }
+
+  // YATA's per-country reading time in ms, or null. YATA sends seconds; the
+  // guard handles a switch to milliseconds.
+  function yataUpdateMs(entry) {
+    const u = entry && typeof entry.update === 'number' ? entry.update : null;
+    if (!u) return null;
+    return u > 1e12 ? u : u * 1000;
+  }
+
+  // True when a quarter-hour restock tick falls in (aMs, bMs].
+  function crossesTick(aMs, bMs) {
+    const q = RESTOCK_TICK_MIN * 60000;
+    return Math.floor(bMs / q) > Math.floor(aMs / q);
+  }
+
+  // True when 00:00 TCT (UTC) falls in (aMs, bMs].
+  function crossesMidnight(aMs, bMs) {
+    const day = 24 * 60 * 60 * 1000;
+    return Math.floor(bMs / day) > Math.floor(aMs / day);
+  }
+
+  // Strip player sell-backs out of a raw stock series. Returns [t, qty]
+  // points where qty is the organic stock: what the shop restocked, minus
+  // what players bought. Rules:
+  //   - A rise is a restock only if organic stock was empty, a tick fell
+  //     between the two YATA readings, and (with 3+ logged cycles) the rise
+  //     is at least RESTOCK_MIN_FRACTION of the usual restock size.
+  //     Any other rise is a sell-back and goes into an overstock offset.
+  //   - Purchases count against organic stock first, so the fitted sell
+  //     rate tracks real demand. Once organic stock hits zero, further
+  //     purchases eat into the overstock and the offset shrinks to match.
+  //   - A fall across 00:00 TCT is Torn clearing overstock, so it reduces
+  //     the offset before anything counts as sales.
+  // Points without a YATA reading time (logged before v2.13) fall back to
+  // the old rule: a rise from empty is a restock.
+  function organicSeries(key, series) {
+    if (!series || series.length < 2) return series;
+    const cycles = loadCycleHistory()[key];
+    const peaks = cycles ? cycles.slice(-15).map((c) => c.peak).filter((p) => p > 0) : [];
+    const typicalPeak = peaks.length >= 3 ? median(peaks) : null;
+    const emptyAt = typicalPeak ? Math.max(1, typicalPeak * NEAR_ZERO_FRACTION) : 0;
+
+    const out = [];
+    let offset = 0;
+    let prev = null;
+    let prevOrganic = 0;
+    for (const p of series) {
+      const [t, q, u] = p;
+      if (prev) {
+        const dq = q - prev[1];
+        const known = prev[2] && u;
+        if (dq > 0) {
+          const fromEmpty = prevOrganic <= emptyAt;
+          const tickOk = known ? crossesTick(prev[2], u) : true;
+          const bigEnough = typicalPeak === null || dq >= typicalPeak * RESTOCK_MIN_FRACTION;
+          if (!(fromEmpty && tickOk && bigEnough)) offset += dq;
+        } else if (dq < 0 && offset > 0 && known && crossesMidnight(prev[2], u)) {
+          offset = Math.max(0, offset + dq);
+        }
+      }
+      let organic = q - offset;
+      if (organic < 0) {
+        offset = q;
+        organic = 0;
+      }
+      out.push([t, organic]);
+      prev = p;
+      prevOrganic = organic;
+    }
+    return out;
   }
 
   // Snap a timestamp up to the next quarter-hour tick.
@@ -1222,11 +1321,18 @@
 
       for (const stockItem of entry.stocks) {
         const itemKey = code + ':' + stockItem.id;
-        const series = hist[itemKey];
+        // Predict from organic stock so player sell-backs don't pose as
+        // restocks or cut the sell-rate fit short.
+        const series = organicSeries(itemKey, hist[itemKey]);
         const pred = predictItem(series, now, itemKey);
+        const organicNow = series && series.length ? series[series.length - 1][1] : stockItem.quantity;
+        const soldBack = Math.max(0, stockItem.quantity - organicNow);
 
         // Verdict accounts for the time to get home and launch before flying.
         const verdict = adviseFlight(stockItem, pred, oneWayMin, now, takeoffDelay);
+        if (soldBack > 0 && verdict.code !== 'learning') {
+          verdict.reason += `. ${soldBack} on the shelf came from player sell-backs`;
+        }
 
         // Drop only items that are empty AND not predicted to restock before
         // you'd land. Everything else is potentially flyable.
@@ -1275,8 +1381,11 @@
 
         const itemsAvailable = affordableUnits;
         const profitPerItem = sellValue !== null ? sellValue - stockItem.cost : null;
+        // The ticket is paid once per trip. The round-trip planner passes
+        // noTicket and charges it once for both legs.
+        const ticket = opts.noTicket ? 0 : ticketCost(code);
         const profitPerTrip =
-          profitPerItem !== null ? profitPerItem * itemsAvailable : null;
+          profitPerItem !== null ? profitPerItem * itemsAvailable - ticket : null;
         const profitPerHour =
           profitPerTrip !== null ? profitPerTrip / roundTripHours : null;
 
@@ -1292,7 +1401,14 @@
         // known and non-positive. Null margins (no API key, no price data)
         // keep their original verdict.
         let rowVerdict = verdict;
-        if (profitPerItem !== null && profitPerItem <= 0) {
+        if (profitPerItem !== null && profitPerItem > 0 && profitPerTrip <= 0) {
+          rowVerdict = {
+            code: 'skip',
+            label: 'No fly',
+            reason: `The ${formatMoney(ticket)} ticket costs more than the ${formatMoney(profitPerItem * itemsAvailable)} you'd make`,
+            expectedStockOnArrival: verdict.expectedStockOnArrival,
+          };
+        } else if (profitPerItem !== null && profitPerItem <= 0) {
           rowVerdict = {
             code: 'skip',
             label: 'No fly',
@@ -1408,6 +1524,18 @@
           label: 'No fly',
           reason: `Refills ~${fmtClock(pred.nextRestockMs)} but sells out again before you land`,
           expectedStockOnArrival: 0,
+        };
+      }
+      // No restock before you land. The shelf may still hold player
+      // sell-backs: buyable, but there's no way to tell how long they last.
+      if (stockItem.quantity > 0) {
+        return {
+          code: 'risky',
+          label: 'Risky',
+          reason: `Only ${stockItem.quantity} sold-back units on the shelf. ${
+            pred.nextRestockMs ? `Next restock ~${fmtClock(pred.nextRestockMs)}, after you'd land` : 'No restock estimate'
+          }`,
+          expectedStockOnArrival: Math.round(stockItem.quantity * DEPLETING_SAFETY_FACTOR),
         };
       }
       // No restock before you land: nothing on the shelf, and you won't wait.
@@ -1759,7 +1887,9 @@
   // Every profitable export: buy in Torn, fly out, sell to the foreign shop.
   // Selling has no stock limit for drugs, so the load is your full capacity,
   // trimmed by cash when the affordability filter is on.
-  function rankExports(now) {
+  // opts.keepBelowTicket keeps exports whose margin doesn't cover the ticket
+  // on its own; the round-trip planner may still use them alongside a return load.
+  function rankExports(now, opts = {}) {
     const rows = [];
     const cap = effectiveCapacity();
     const takeoffDelay = travelState.delayToTakeoffMin || 0;
@@ -1832,7 +1962,9 @@
         );
         if (watchlistFilter && !isWatched) continue;
 
-        const profitPerTrip = margin * units;
+        const ticket = ticketCost(code);
+        const profitPerTrip = margin * units - ticket;
+        if (profitPerTrip <= 0 && !opts.keepBelowTicket) continue;
         rows.push({
           country: country.name,
           countryCode: code,
@@ -1844,6 +1976,7 @@
           sellAtLanding,
           landHour,
           profile,
+          ticket,
           margin,
           units,
           priced,
@@ -1881,7 +2014,7 @@
   // cash you'd hold after the export sale.
   function rankRoundTrips(hist, now) {
     const exportsByCountry = {};
-    for (const e of rankExports(now)) {
+    for (const e of rankExports(now, { keepBelowTicket: true })) {
       // Only exports priced from live listings count. rankExports sorts best
       // first and round-trip time is per country, so the first live row per
       // country is that country's best export either way.
@@ -1903,6 +2036,7 @@
         cash: cashAbroad,
         onlyCountry: code,
         ignoreWatchFilter: true,
+        noTicket: true,
       }).filter(
         (r) =>
           (r.verdict.code === 'go' || r.verdict.code === 'risky') &&
@@ -1914,9 +2048,11 @@
         if (!back || r.profitPerTrip > back.profitPerTrip) back = r;
       }
 
-      const outProfit = out ? out.profitPerTrip : 0;
+      // Leg figures are before the ticket; the ticket comes off once.
+      const ticket = ticketCost(code);
+      const outProfit = out ? out.margin * out.units : 0;
       const backProfit = back ? back.profitPerTrip : 0;
-      const total = outProfit + backProfit;
+      const total = outProfit + backProfit - ticket;
       if (total <= 0) continue;
 
       const roundTripMin = effectiveOneWay(code) * 2;
@@ -1938,6 +2074,7 @@
         back,
         outProfit,
         backProfit,
+        ticket,
         profitPerTrip: total,
         profitPerHour: total / (roundTripMin / 60),
         roundTripMin,
@@ -2061,7 +2198,7 @@
     return `Buy ${e.boughtUnits} off the Item Market for ${formatMoney(e.outlay)} (cheapest ${formatMoney(e.lowest)})`;
   }
 
-  function exportReason(e) {
+  function exportReason(e, withTicket = true) {
     let reason = e.priced === 'live'
       ? `${exportBuyAdvice(e)}, sell at ~${formatMoney(e.sellAtLanding)} each`
       : `Estimate only: ${e.units} at market_value ${formatMoney(e.buy)}, sell at ~${formatMoney(e.sellAtLanding)} each`;
@@ -2071,6 +2208,7 @@
     if (e.priced === 'live' && e.owned > e.useOwned && e.useOwned === e.units) {
       reason += `. You hold ${e.owned}, more than one load`;
     }
+    if (withTicket && e.ticket > 0) reason += `. Profit is after the ${formatMoney(e.ticket)} ticket`;
     if (e.thinMarket) reason += '. Not enough cheap listings to fill your load';
     else if (e.cashLimited) reason += '. Cash limits the load';
     if (e.profile && e.profile.best) {
@@ -2138,8 +2276,9 @@
           const outText = legText(r.out, r.out ? r.out.units : 0);
           const backText = legText(r.back, r.back ? r.back.itemsAvailable : 0);
           const reason = [
-            r.out ? `Out: ${exportReason(r.out)}` : 'Out: no profitable export',
+            r.out ? `Out: ${exportReason(r.out, false)}` : 'Out: no profitable export',
             r.back ? `Back: ${r.back.verdict.reason}` : 'Back: nothing worth buying',
+            ...(r.ticket > 0 ? [`Total is after the ${formatMoney(r.ticket)} ticket`] : []),
           ].join('. ');
           const verdict = { ...r.verdict, reason };
           return `
