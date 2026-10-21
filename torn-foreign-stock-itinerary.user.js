@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.11.1
+// @version      2.12.0
 // @description  Tracks foreign stock via YATA, ranks travel itineraries by profit, plans drug exports and full round trips for Travel 2.0
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -116,6 +116,12 @@
   // and capped per refresh to stay well inside the API's 100 calls/minute.
   const LISTINGS_TTL_MS = 5 * 60 * 1000;
   const LISTINGS_MAX_PER_REFRESH = 15;
+
+  // Your own inventory, read from the v2 user/inventory endpoint so exports
+  // can tell you to pack what you already hold before buying more. Torn
+  // caches inventory responses for up to an hour, so refetching more often
+  // than every 10 minutes gains nothing.
+  const INVENTORY_TTL_MS = 10 * 60 * 1000;
 
   // ---------------------------------------------------------------------
   // Restock prediction config
@@ -1662,6 +1668,73 @@
     return [...ids];
   }
 
+  // itemId -> quantity you hold, summed across stacks. inventoryState tracks
+  // when it was read and any error, so the table can say how fresh it is.
+  let inventoryCounts = {};
+  let inventoryState = { fetchedAt: 0, error: null, loaded: false };
+
+  // Read your inventory for every item category a foreign shop buys. One
+  // paginated call per category (Drug, Plushie, Flower and so on).
+  async function refreshInventory() {
+    if (!TORN_API_KEY || Object.keys(itemPrices).length === 0) return false;
+    if (Date.now() - inventoryState.fetchedAt < INVENTORY_TTL_MS) return false;
+
+    const categories = new Set();
+    for (const id of exportCandidateIds()) {
+      const type = itemPrices[id] && itemPrices[id].type;
+      if (type) categories.add(type);
+    }
+    if (!categories.size) return false;
+
+    const counts = {};
+    try {
+      for (const cat of categories) {
+        let offset = 0;
+        // Stop at 2,000 rows per category: no export decision needs more.
+        while (offset < 2000) {
+          const data = await gmFetch(
+            'https://api.torn.com/v2/user/inventory?cat=' + encodeURIComponent(cat)
+              + '&limit=250&offset=' + offset,
+            { headers: { 'Authorization': 'ApiKey ' + TORN_API_KEY } }
+          );
+          if (data.error) throw new Error('API ' + data.error.code + ': ' + data.error.error);
+          const rows = data.inventory && Array.isArray(data.inventory.items)
+            ? data.inventory.items
+            : null;
+          if (!rows) {
+            console.warn('[TSI] Unexpected inventory shape:', JSON.stringify(data).slice(0, 600));
+            throw new Error('Unexpected response');
+          }
+          for (const it of rows) {
+            const id = Number(it.id);
+            const qty = Number(it.amount ?? it.quantity ?? 1);
+            if (id > 0 && qty > 0) counts[id] = (counts[id] || 0) + qty;
+          }
+          offset += rows.length;
+          if (rows.length < 250) break;
+        }
+      }
+      inventoryCounts = counts;
+      inventoryState = { fetchedAt: Date.now(), error: null, loaded: true };
+    } catch (err) {
+      // Keep the last good counts; just record why this read failed.
+      inventoryState = { ...inventoryState, fetchedAt: Date.now(), error: err.message || 'Network error' };
+    }
+    return true;
+  }
+
+  function ownedCount(itemId) {
+    return inventoryState.loaded ? inventoryCounts[itemId] || 0 : 0;
+  }
+
+  // Refresh inventory and stale listings for the export views. Returns true
+  // if anything was fetched so the caller can re-render.
+  async function refreshExportData() {
+    const invFetched = await refreshInventory();
+    const listingsFetched = await refreshExportListings();
+    return invFetched || listingsFetched;
+  }
+
   // Refresh stale listings for export candidates, oldest first, capped per
   // call. Returns true if anything was fetched so the caller can re-render.
   async function refreshExportListings() {
@@ -1719,20 +1792,29 @@
         }
 
         const cashLimit = affordFilter && userMoney !== null ? userMoney : null;
+        const owned = ownedCount(s.id);
         let buy, units, lowest = null, priced, thinMarket = false;
+        let useOwned = 0, boughtUnits = 0, buyOutlay = 0;
         if (live && live.listings) {
-          // Real cost of the load: cheapest listings first, stopping where a
-          // listing would no longer turn a profit at the sale price.
-          const profitable = live.listings.filter((l) => l.price < sellAtLanding);
-          const plan = planPurchase(profitable, cap, cashLimit);
           lowest = live.listings.length ? live.listings[0].price : null;
-          if (plan.units < 1) continue;
-          units = plan.units;
-          buy = plan.total / plan.units;
+          // Units you already hold go in first. Each one is worth what you'd
+          // get selling it at home instead, roughly the cheapest listing, so
+          // pack them only when the foreign shop pays more than that.
+          const homeValue = lowest !== null ? lowest : mv;
+          if (homeValue !== null && homeValue < sellAtLanding) useOwned = Math.min(owned, cap);
+          // Top up the rest from the Item Market, cheapest listings first,
+          // stopping where a listing would no longer turn a profit.
+          const profitable = live.listings.filter((l) => l.price < sellAtLanding);
+          const plan = planPurchase(profitable, cap - useOwned, cashLimit);
+          units = useOwned + plan.units;
+          if (units < 1) continue;
+          boughtUnits = plan.units;
+          buyOutlay = plan.total;
+          buy = (plan.total + useOwned * homeValue) / units;
           priced = 'live';
           // Thin market: not enough profitable listings to fill the load even
           // with unlimited cash.
-          thinMarket = planPurchase(profitable, cap, null).units < cap;
+          thinMarket = useOwned + planPurchase(profitable, cap - useOwned, null).units < cap;
         } else {
           // Not checked yet (or the check failed): estimate from market_value
           // and flag the row so nobody flies on it.
@@ -1769,7 +1851,11 @@
           thinMarket,
           priceError: live && live.error ? live.error : null,
           cashLimited: units < cap && !thinMarket,
-          outlay: buy * units,
+          owned,
+          useOwned,
+          boughtUnits,
+          // Cash you actually spend in Torn. Packed units cost nothing up front.
+          outlay: priced === 'live' ? buyOutlay : buy * units,
           profitPerTrip,
           profitPerHour: profitPerTrip / (roundTripMin / 60),
           roundTripMin,
@@ -1811,7 +1897,7 @@
       const out = exportsByCountry[code] || null;
       const cashAbroad = userMoney === null
         ? null
-        : userMoney + (out ? out.units * (out.sellAtLanding - out.buy) : 0);
+        : userMoney + (out ? out.units * out.sellAtLanding - out.outlay : 0);
 
       const inRows = rankItineraries(hist, now, {
         cash: cashAbroad,
@@ -1920,6 +2006,40 @@
     return html;
   }
 
+  // Short buy/pack hint under the item name, visible on mobile too.
+  function packCell(e) {
+    if (e.priced !== 'live') {
+      return e.owned > 0 ? `<div style="font-size:10px;color:#888">you hold ${e.owned}</div>` : '';
+    }
+    let text, color;
+    if (e.useOwned > 0 && e.boughtUnits === 0) {
+      text = `pack ${e.useOwned} you hold, buy none`;
+      color = '#9fe8b0';
+    } else if (e.useOwned > 0) {
+      text = `pack ${e.useOwned}, buy ${e.boughtUnits}`;
+      color = '#f0d27a';
+    } else {
+      text = `buy ${e.boughtUnits}`;
+      color = '#f0d27a';
+    }
+    return `<div style="font-size:10px;color:${color}">${text}</div>`;
+  }
+
+  // Footer row for the export views: how fresh the inventory read is.
+  function inventoryNoteRow() {
+    let msg;
+    if (!TORN_API_KEY) return '';
+    if (inventoryState.error && !inventoryState.loaded) {
+      msg = `Couldn't read your inventory (${escapeHTML(inventoryState.error)}). Advice assumes you hold nothing. The key may need inventory access.`;
+    } else if (!inventoryState.loaded) {
+      msg = 'Reading your inventory...';
+    } else {
+      msg = `Inventory checked ${fmtClock(inventoryState.fetchedAt)}. Torn can serve it up to an hour old, so recent buys may not show yet.`;
+      if (inventoryState.error) msg += ` Last refresh failed: ${escapeHTML(inventoryState.error)}.`;
+    }
+    return `<tr><td colspan="7" style="color:#888;font-size:10px">${msg}</td></tr>`;
+  }
+
   // Verdict chip for an export row. Only live-priced rows get a Go.
   function exportVerdict(e) {
     if (e.priced === 'live') return { code: 'go', label: 'Go', reason: exportReason(e) };
@@ -1929,10 +2049,27 @@
     return { code: 'learning', label: 'Checking', reason: 'Fetching live Item Market listings. Estimate uses market_value, which lags' };
   }
 
+  // What to do before flying: pack what you hold, buy the rest.
+  function exportBuyAdvice(e) {
+    if (e.useOwned > 0 && e.boughtUnits === 0) {
+      return `Pack ${e.useOwned} from your inventory, no need to buy`;
+    }
+    if (e.useOwned > 0) {
+      return `Pack the ${e.useOwned} you hold and buy ${e.boughtUnits} more for ${formatMoney(e.outlay)} (cheapest ${formatMoney(e.lowest)})`;
+    }
+    return `Buy ${e.boughtUnits} off the Item Market for ${formatMoney(e.outlay)} (cheapest ${formatMoney(e.lowest)})`;
+  }
+
   function exportReason(e) {
     let reason = e.priced === 'live'
-      ? `Buy ${e.units} off the Item Market for ${formatMoney(e.outlay)} (avg ${formatMoney(e.buy)}, cheapest ${formatMoney(e.lowest)}), sell at ~${formatMoney(e.sellAtLanding)} each`
+      ? `${exportBuyAdvice(e)}, sell at ~${formatMoney(e.sellAtLanding)} each`
       : `Estimate only: ${e.units} at market_value ${formatMoney(e.buy)}, sell at ~${formatMoney(e.sellAtLanding)} each`;
+    if (e.priced === 'live' && e.useOwned > 0) {
+      reason += '. Units you hold count at the cheapest listing, what they\'d fetch at home';
+    }
+    if (e.priced === 'live' && e.owned > e.useOwned && e.useOwned === e.units) {
+      reason += `. You hold ${e.owned}, more than one load`;
+    }
     if (e.thinMarket) reason += '. Not enough cheap listings to fill your load';
     else if (e.cashLimited) reason += '. Cash limits the load';
     if (e.profile && e.profile.best) {
@@ -1964,7 +2101,7 @@
             return `
               <tr class="tsi-alt-row ${e.isWatched ? 'tsi-watched' : ''}" data-key="${e.countryCode}:x${e.itemId}">
                 <td>${verdictCell(verdict)}</td>
-                <td${dim}><span class="tsi-ccode">${e.countryCode.toUpperCase()}</span> ${escapeHTML(e.item)} ×${e.units}${e.isWatched ? ' ★' : ''}</td>
+                <td${dim}><span class="tsi-ccode">${e.countryCode.toUpperCase()}</span> ${escapeHTML(e.item)} ×${e.units}${e.isWatched ? ' ★' : ''}${packCell(e)}</td>
                 <td class="${valCls}"${dim} title="${escapeHTML(exportReason(e))}">${formatMoney(e.margin)}${live ? '' : '?'}</td>
                 <td class="${valCls}"${dim}>${formatMoney(e[pickField])}${live ? '' : '?'}</td>
                 <td class="tsi-col-extra">${formatMoney(e.buy)}${live ? '' : ' <span style="color:#888">(est)</span>'}</td>
@@ -1977,6 +2114,7 @@
               ? 'No profitable exports right now with your settings.'
               : 'Add a Torn API key to price exports.'
           }</td></tr>`;
+      tbody.innerHTML += inventoryNoteRow();
 
       if (dom.bestpick) {
         const p = rows.find((r) => r.priced === 'live');
@@ -2015,6 +2153,7 @@
             </tr>`;
         }).join('')
       : `<tr><td colspan="7" style="color:#888">No profitable round trips right now with your settings.</td></tr>`;
+    tbody.innerHTML += inventoryNoteRow();
 
     if (dom.bestpick) {
       const best = rows.find((r) => r.verdict.code === 'go');
@@ -2022,7 +2161,7 @@
         dom.bestpick.style.display = 'block';
         const outBit = best.out ? `${best.out.units}× ${escapeHTML(best.out.item)} out` : 'fly out empty';
         const backBit = best.back ? `${best.back.itemsAvailable}× ${escapeHTML(best.back.item)} back` : 'fly back empty';
-        dom.bestpick.innerHTML = `<strong>Best round trip:</strong> ${escapeHTML(best.country)}. ${outBit}, ${backBit}. ${formatMoney(best[pickField])}${pickUnit}`;
+        dom.bestpick.innerHTML = `<strong>Best round trip:</strong> ${escapeHTML(best.country)}. ${outBit}, ${backBit}. ${formatMoney(best[pickField])}${pickUnit}${best.out ? '. ' + escapeHTML(exportBuyAdvice(best.out)) : ''}`;
       } else {
         dom.bestpick.style.display = 'none';
       }
@@ -2703,7 +2842,7 @@
       GM_setValue('viewMode', viewMode);
       renderTable();
       if (viewMode === 'export' || viewMode === 'roundtrip') {
-        refreshExportListings().then((fetched) => { if (fetched) renderTable(); });
+        refreshExportData().then((fetched) => { if (fetched) renderTable(); });
       }
     });
 
@@ -3272,7 +3411,7 @@
     // Export and round-trip views need live Item Market prices. Fetch only
     // while one of those tabs is open, then re-render with real numbers.
     if (viewMode === 'export' || viewMode === 'roundtrip') {
-      if (await refreshExportListings()) renderTable(hist, Date.now());
+      if (await refreshExportData()) renderTable(hist, Date.now());
     }
 
     if (dom.status) {

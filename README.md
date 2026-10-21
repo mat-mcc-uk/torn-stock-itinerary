@@ -59,6 +59,7 @@ Three tabs sit above the table:
 
 - **Stock:** the original view. Buy abroad, sell in Torn.
 - **Export:** buy in Torn, sell to a foreign shop. Foreign shops only buy what they sell. Drugs sell back at the shelf price, everything else at 75% of it. The sell column shows today's price and, once the script has learned it, the average for the hour you'd land.
+- Export rows also read your inventory and tell you what to do before flying: pack what you hold, buy the rest. Units you already hold count at the cheapest Item Market listing, since that's roughly what they'd fetch if you sold them at home instead. The key needs inventory access for this, and Torn can serve inventory up to an hour old.
 - **Round trip:** one row per country with the best export out and the best stock buy back. Slots free up after the export sale, so both legs use your full capacity.
 
 Black market prices move through the day. The script logs them every refresh and builds an hour-of-day average per drug and country over the last 7 days. An hour only counts once it has data from two separate days, so the landing-hour figure appears after a couple of days of running.
