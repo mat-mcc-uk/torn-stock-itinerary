@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Foreign Stock & Itinerary Optimizer
 // @namespace    mcc.torn.stock-itinerary
-// @version      2.11.0
+// @version      2.11.1
 // @description  Tracks foreign stock via YATA, ranks travel itineraries by profit, plans drug exports and full round trips for Travel 2.0
 // @author       Mat
 // @homepageURL  https://github.com/mat-mcc-uk/torn-stock-itinerary
@@ -108,6 +108,14 @@
   // An hour bucket needs samples from this many separate days before the
   // script trusts it over the current price.
   const BM_MIN_DAYS_PER_HOUR = 2;
+
+  // Torn's market_value updates once a day and lags badly when prices move
+  // fast, as drug prices did after Phase 3. Exports price the Torn side from
+  // live Item Market listings instead: the real cost of buying your whole
+  // load, cheapest listings first. Refetched at most every 5 minutes per item,
+  // and capped per refresh to stay well inside the API's 100 calls/minute.
+  const LISTINGS_TTL_MS = 5 * 60 * 1000;
+  const LISTINGS_MAX_PER_REFRESH = 15;
 
   // ---------------------------------------------------------------------
   // Restock prediction config
@@ -1584,12 +1592,90 @@
     return { byHour, best };
   }
 
-  // What you'd pay per unit in Torn. Uses a live Item Market average when
-  // you've fetched one, otherwise market_value.
-  function tornBuyPrice(itemId) {
-    if (livePriceCache[itemId]) return livePriceCache[itemId];
-    const info = itemPrices[itemId];
-    return info && info.market_value > 0 ? info.market_value : null;
+  // itemId -> { fetchedAt, listings: [{ price, amount }] } or { fetchedAt, error }
+  const liveListings = {};
+
+  // Pull current Item Market listings for one item, cheapest first. The v2
+  // response nests listings under itemmarket; older shapes put them at the
+  // top level. Listing quantity has appeared as amount and as quantity.
+  async function fetchListings(itemId) {
+    const fetchedAt = Date.now();
+    try {
+      const data = await gmFetch(
+        'https://api.torn.com/v2/market/' + itemId + '/itemmarket?limit=100',
+        { headers: { 'Authorization': 'ApiKey ' + TORN_API_KEY } }
+      );
+      if (data.error) {
+        liveListings[itemId] = { fetchedAt, error: 'API ' + data.error.code + ': ' + data.error.error };
+        return;
+      }
+      const raw = (data.itemmarket && data.itemmarket.listings) || data.listings;
+      if (!Array.isArray(raw)) {
+        console.warn('[TSI] Unexpected listings shape:', JSON.stringify(data).slice(0, 600));
+        liveListings[itemId] = { fetchedAt, error: 'Unexpected response' };
+        return;
+      }
+      const listings = raw
+        .map((l) => ({ price: Number(l.price), amount: Number(l.amount ?? l.quantity ?? 1) }))
+        .filter((l) => l.price > 0 && l.amount > 0)
+        .sort((a, b) => a.price - b.price);
+      liveListings[itemId] = { fetchedAt, listings };
+    } catch (err) {
+      liveListings[itemId] = { fetchedAt, error: err.message || 'Network error' };
+    }
+  }
+
+  // Walk the listings cheapest first and buy up to `want` units without
+  // spending more than `cash` (null = no cash limit). Returns the units you'd
+  // get, their total cost, and the cheapest listing price.
+  function planPurchase(listings, want, cash) {
+    let units = 0;
+    let total = 0;
+    for (const l of listings) {
+      if (units >= want) break;
+      let take = Math.min(l.amount, want - units);
+      if (cash !== null) take = Math.min(take, Math.floor((cash - total) / l.price));
+      if (take <= 0) break;
+      units += take;
+      total += take * l.price;
+    }
+    return { units, total, lowest: listings.length ? listings[0].price : null };
+  }
+
+  // Items worth checking: everything a foreign shop sells whose sale value
+  // could plausibly beat Torn's price. market_value only ever understates
+  // the problem in one direction for this check, so use a loose filter
+  // (sale value above half of market_value) to avoid skipping real exports.
+  function exportCandidateIds() {
+    const ids = new Set();
+    for (const [code, entry] of Object.entries(stockData)) {
+      if (!COUNTRIES[code] || !entry || !Array.isArray(entry.stocks)) continue;
+      if (countryFilter !== 'all' && countryFilter !== code) continue;
+      for (const s of entry.stocks) {
+        if (!(s.cost > 0)) continue;
+        const info = itemPrices[s.id];
+        if (!info || !(info.market_value > 0)) continue;
+        const sale = isBlackMarket(s.id) ? s.cost : s.cost * FOREIGN_RESALE_MULT;
+        if (sale > info.market_value * 0.5) ids.add(s.id);
+      }
+    }
+    return [...ids];
+  }
+
+  // Refresh stale listings for export candidates, oldest first, capped per
+  // call. Returns true if anything was fetched so the caller can re-render.
+  async function refreshExportListings() {
+    if (!TORN_API_KEY || Object.keys(itemPrices).length === 0) return false;
+    const now = Date.now();
+    const stale = exportCandidateIds()
+      .filter((id) => !liveListings[id] || now - liveListings[id].fetchedAt > LISTINGS_TTL_MS)
+      .sort((a, b) => (liveListings[a]?.fetchedAt || 0) - (liveListings[b]?.fetchedAt || 0))
+      .slice(0, LISTINGS_MAX_PER_REFRESH);
+    if (!stale.length) return false;
+    // Sequential, not parallel: a burst of 15 at once is the kind of
+    // pattern Torn's API throttling dislikes.
+    for (const id of stale) await fetchListings(id);
+    return true;
   }
 
   // "14:00 TCT" label for a UTC hour.
@@ -1617,8 +1703,10 @@
 
       for (const s of entry.stocks) {
         if (!(s.cost > 0)) continue;
-        const buy = tornBuyPrice(s.id);
-        if (buy === null) continue;
+        const info = itemPrices[s.id];
+        const mv = info && info.market_value > 0 ? info.market_value : null;
+        const live = liveListings[s.id];
+        if (mv === null && !(live && live.listings)) continue;
 
         const blackMarket = isBlackMarket(s.id);
         const sellNow = blackMarket ? s.cost : s.cost * FOREIGN_RESALE_MULT;
@@ -1630,14 +1718,32 @@
           if (hourly) sellAtLanding = hourly;
         }
 
+        const cashLimit = affordFilter && userMoney !== null ? userMoney : null;
+        let buy, units, lowest = null, priced, thinMarket = false;
+        if (live && live.listings) {
+          // Real cost of the load: cheapest listings first, stopping where a
+          // listing would no longer turn a profit at the sale price.
+          const profitable = live.listings.filter((l) => l.price < sellAtLanding);
+          const plan = planPurchase(profitable, cap, cashLimit);
+          lowest = live.listings.length ? live.listings[0].price : null;
+          if (plan.units < 1) continue;
+          units = plan.units;
+          buy = plan.total / plan.units;
+          priced = 'live';
+          // Thin market: not enough profitable listings to fill the load even
+          // with unlimited cash.
+          thinMarket = planPurchase(profitable, cap, null).units < cap;
+        } else {
+          // Not checked yet (or the check failed): estimate from market_value
+          // and flag the row so nobody flies on it.
+          buy = mv;
+          units = cashLimit === null ? cap : Math.min(cap, Math.floor(cashLimit / mv));
+          if (units < 1) continue;
+          priced = live && live.error ? 'error' : 'pending';
+        }
+
         const margin = sellAtLanding - buy;
         if (margin <= 0) continue;
-
-        let units = cap;
-        if (affordFilter && userMoney !== null) {
-          units = Math.min(cap, Math.floor(userMoney / buy));
-        }
-        if (units < 1) continue;
 
         const isWatched = watchlist.some(
           (w) => w.toLowerCase() === String(s.name).toLowerCase()
@@ -1658,7 +1764,11 @@
           profile,
           margin,
           units,
-          cashLimited: units < cap,
+          priced,
+          lowest,
+          thinMarket,
+          priceError: live && live.error ? live.error : null,
+          cashLimited: units < cap && !thinMarket,
           outlay: buy * units,
           profitPerTrip,
           profitPerHour: profitPerTrip / (roundTripMin / 60),
@@ -1668,8 +1778,14 @@
       }
     }
 
+    // Live-priced rows first; unverified estimates sink to the bottom.
     const field = profitMode === 'trip' ? 'profitPerTrip' : 'profitPerHour';
-    rows.sort((a, b) => b[field] - a[field]);
+    rows.sort((a, b) => {
+      const la = a.priced === 'live' ? 0 : 1;
+      const lb = b.priced === 'live' ? 0 : 1;
+      if (la !== lb) return la - lb;
+      return b[field] - a[field];
+    });
     return rows;
   }
 
@@ -1680,8 +1796,10 @@
   function rankRoundTrips(hist, now) {
     const exportsByCountry = {};
     for (const e of rankExports(now)) {
-      // rankExports sorts best first and round-trip time is per country, so
-      // the first row per country is that country's best export either way.
+      // Only exports priced from live listings count. rankExports sorts best
+      // first and round-trip time is per country, so the first live row per
+      // country is that country's best export either way.
+      if (e.priced !== 'live') continue;
       if (!exportsByCountry[e.countryCode]) exportsByCountry[e.countryCode] = e;
     }
 
@@ -1802,9 +1920,21 @@
     return html;
   }
 
+  // Verdict chip for an export row. Only live-priced rows get a Go.
+  function exportVerdict(e) {
+    if (e.priced === 'live') return { code: 'go', label: 'Go', reason: exportReason(e) };
+    if (e.priced === 'error') {
+      return { code: 'skip', label: 'No price', reason: `Item Market check failed (${e.priceError}). Estimate uses market_value, which lags` };
+    }
+    return { code: 'learning', label: 'Checking', reason: 'Fetching live Item Market listings. Estimate uses market_value, which lags' };
+  }
+
   function exportReason(e) {
-    let reason = `Buy ${e.units} in Torn at ~${formatMoney(e.buy)} (${formatMoney(e.outlay)}), sell at ~${formatMoney(e.sellAtLanding)} each`;
-    if (e.cashLimited) reason += '. Cash limits the load';
+    let reason = e.priced === 'live'
+      ? `Buy ${e.units} off the Item Market for ${formatMoney(e.outlay)} (avg ${formatMoney(e.buy)}, cheapest ${formatMoney(e.lowest)}), sell at ~${formatMoney(e.sellAtLanding)} each`
+      : `Estimate only: ${e.units} at market_value ${formatMoney(e.buy)}, sell at ~${formatMoney(e.sellAtLanding)} each`;
+    if (e.thinMarket) reason += '. Not enough cheap listings to fill your load';
+    else if (e.cashLimited) reason += '. Cash limits the load';
     if (e.profile && e.profile.best) {
       reason += `. Best hour so far: ${fmtTornHour(e.profile.best.hour)} at ~${formatMoney(e.profile.best.price)}`;
     } else if (e.blackMarket) {
@@ -1827,14 +1957,17 @@
       const rows = rankExports(now);
       tbody.innerHTML = rows.length
         ? rows.slice(0, 50).map((e) => {
-            const verdict = { code: 'go', label: 'Go', reason: exportReason(e) };
+            const verdict = exportVerdict(e);
+            const live = e.priced === 'live';
+            const valCls = live ? 'tsi-profit-pos' : '';
+            const dim = live ? '' : ' style="color:#888"';
             return `
               <tr class="tsi-alt-row ${e.isWatched ? 'tsi-watched' : ''}" data-key="${e.countryCode}:x${e.itemId}">
                 <td>${verdictCell(verdict)}</td>
-                <td><span class="tsi-ccode">${e.countryCode.toUpperCase()}</span> ${escapeHTML(e.item)} ×${e.units}${e.isWatched ? ' ★' : ''}</td>
-                <td class="tsi-profit-pos" title="${escapeHTML(exportReason(e))}">${formatMoney(e.margin)}</td>
-                <td class="tsi-profit-pos">${formatMoney(e[pickField])}</td>
-                <td class="tsi-col-extra">${formatMoney(e.buy)}${livePriceCache[e.itemId] ? '' : ' <span style="color:#888">(mv)</span>'}</td>
+                <td${dim}><span class="tsi-ccode">${e.countryCode.toUpperCase()}</span> ${escapeHTML(e.item)} ×${e.units}${e.isWatched ? ' ★' : ''}</td>
+                <td class="${valCls}"${dim} title="${escapeHTML(exportReason(e))}">${formatMoney(e.margin)}${live ? '' : '?'}</td>
+                <td class="${valCls}"${dim}>${formatMoney(e[pickField])}${live ? '' : '?'}</td>
+                <td class="tsi-col-extra">${formatMoney(e.buy)}${live ? '' : ' <span style="color:#888">(est)</span>'}</td>
                 <td class="tsi-col-extra">${exportPriceCell(e)}</td>
                 <td class="tsi-col-extra">${formatTime(e.roundTripMin)}</td>
               </tr>`;
@@ -1846,8 +1979,8 @@
           }</td></tr>`;
 
       if (dom.bestpick) {
-        if (rows.length) {
-          const p = rows[0];
+        const p = rows.find((r) => r.priced === 'live');
+        if (p) {
           dom.bestpick.style.display = 'block';
           dom.bestpick.innerHTML = `<strong>Export now:</strong> ${p.units}× ${escapeHTML(p.item)} to ${escapeHTML(p.country)}, ${formatMoney(p[pickField])}${pickUnit}. ${escapeHTML(exportReason(p))}`;
         } else {
@@ -2569,6 +2702,9 @@
       viewMode = btn.dataset.view;
       GM_setValue('viewMode', viewMode);
       renderTable();
+      if (viewMode === 'export' || viewMode === 'roundtrip') {
+        refreshExportListings().then((fetched) => { if (fetched) renderTable(); });
+      }
     });
 
     document.getElementById('tsi-reset-data').addEventListener('click', () => {
@@ -3132,6 +3268,12 @@
     }
 
     renderTable(hist, now);
+
+    // Export and round-trip views need live Item Market prices. Fetch only
+    // while one of those tabs is open, then re-render with real numbers.
+    if (viewMode === 'export' || viewMode === 'roundtrip') {
+      if (await refreshExportListings()) renderTable(hist, Date.now());
+    }
 
     if (dom.status) {
       if (failed.length === 0) {
